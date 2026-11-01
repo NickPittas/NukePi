@@ -225,7 +225,7 @@ class PythonExecutor:
                 result = run_compiled(units, self.namespace)
             meta = metadata()
             response = {
-                "success": not meta["node_errors"],
+                "success": True,
                 "result": _json_value(result),
                 "result_repr": repr(result),
                 "stdout": stdout.getvalue(),
@@ -236,8 +236,12 @@ class PythonExecutor:
                 "elapsed_ms": elapsed(),
             }
             if meta["node_errors"]:
-                response["error"] = "Code ran, but nodes report errors: " + ", ".join(
-                    entry["node"] for entry in meta["node_errors"]
+                # The code completed and its changes are recorded; the error state is a diagnostic of the
+                # resulting image/channels (a missing input or channel, for example), not a failed run.
+                response["node_errors_note"] = (
+                    "the code completed and its changes are recorded; these nodes report an error state "
+                    "(for example a missing input or channel) that affects their image: "
+                    + ", ".join(entry["node"] for entry in meta["node_errors"])
                 )
             return response
         except BaseException as exc:

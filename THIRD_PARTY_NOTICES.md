@@ -6,6 +6,8 @@ Nuke Pi (`nuke-codex-panel`) is MIT licensed, Copyright (c) 2026 Nick Pittas (se
 
 The Pi used by the panel is the **official, unmodified Pi 1.4.0** (`@earendil-works/pi-coding-agent`, MIT, author Mario Zechner) from the npm registry, pinned by `runtime/pi/package-lock.json` and `runtime/pi/manifest.json`. "Custom Pi" here means official pinned Pi plus this project's own extensions and configuration. No upstream source is copied into or modified in this repository, and the upstream packages keep their own licenses and copyright holders.
 
+Additionally the panel loads one third-party Pi extension: **`pi-ask-user` 0.17.1** (MIT, Copyright (c) 2026 Enzo Lucchesi, `https://github.com/edlsh/pi-ask-user`), pinned by the same lockfile and manifest, with its npm peer `@sinclair/typebox` 0.34.52 (MIT). Their license files are copied into the installed `runtime/pi/third-party-notices/npm/` like every other locked package. The extension is unmodified.
+
 ## Node.js
 
 The official Node.js 26.12.0 binary distribution for the target platform (Linux x64, Windows x64, macOS x64, macOS arm64) is downloaded from nodejs.org at install time and verified by the sha256 pinned in `runtime/pi/manifest.json`. Node.js is MIT licensed and its `LICENSE` file additionally carries notices for bundled third-party components (for example V8, OpenSSL, ICU, npm and others). That full upstream `LICENSE` is preserved unmodified in the installed runtime.

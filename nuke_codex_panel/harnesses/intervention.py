@@ -484,6 +484,36 @@ class ControlLease:
         control = self._ensure()
         return control.revoke(self.control_id) if control is not None else None
 
+    # The ask-before-further-changes gate lives in the bridge control (see BridgeControl). All three are
+    # no-ops without a local bridge control.
+    def enable_question_gate(self) -> None:
+        """This harness can ask the person a question, so the bridge may gate scene changes on one."""
+        control = self._ensure()
+        enable = getattr(control, "enable_question_gate", None) if control is not None else None
+        if enable is not None:
+            enable(self.control_id)
+
+    def reset_conversation(self) -> None:
+        """A fresh chat starts on this control: drop the old conversation's bridge state and gate."""
+        control = self._ensure()
+        reset = getattr(control, "reset_conversation", None) if control is not None else None
+        if reset is not None:
+            reset(self.control_id)
+
+    def question_answered(self, answers: list[str]) -> None:
+        """The person completed a question; lifts the gate unless they chose to stop."""
+        control = self._ensure()
+        note = getattr(control, "question_answered", None) if control is not None else None
+        if note is not None:
+            note(self.control_id, answers)
+
+    def person_message(self) -> None:
+        """The person sent a new message to the agent; it is their direction, so the gate lifts."""
+        control = self._ensure()
+        note = getattr(control, "person_message", None) if control is not None else None
+        if note is not None:
+            note(self.control_id)
+
     def _require(self):
         control = self._ensure()
         if control is None:

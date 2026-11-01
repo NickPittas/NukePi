@@ -847,6 +847,28 @@ def apply_viewer_navigation(viewer, window, navigation: dict) -> dict:
     return meta
 
 
+# `channels` alone cannot tell RGB from Alpha (both report 'rgba'); layer_display_style is the observed discriminator.
+_DISPLAY_KNOBS = ("channels", "layer_display_style", "display", "ignore_alpha", "gain", "gamma")
+
+
+def _viewer_display(viewer) -> dict | None:
+    """The Viewer's channel/display state exactly as its knobs report it; None when none is readable.
+
+    Only knobs that exist on this Viewer are read; an unreadable knob is omitted, never guessed.
+    """
+    knobs = viewer.knobs()
+    state = {}
+    for name in _DISPLAY_KNOBS:
+        if name not in knobs:
+            continue
+        try:
+            value = knobs[name].value()
+        except Exception:
+            continue
+        state[name] = value if isinstance(value, (int, float, bool, str)) else str(value)
+    return state or None
+
+
 def _capture_viewer(frame, directory: Path, navigation: dict | None = None) -> tuple[Path, dict]:
     """Synchronously render the existing Viewer at ``frame`` via nuke.executeMultiple.
 
@@ -900,6 +922,7 @@ def _capture_viewer(frame, directory: Path, navigation: dict | None = None) -> t
             source = viewer.input(index) if index is not None else None
             inputs[label] = (index, source.fullName() if source is not None else None)
     process = viewer["viewerProcess"].value() if "viewerProcess" in viewer.knobs() else ""
+    display = _viewer_display(viewer)
     restorers = []
     restore_errors = []
     navigation_meta = {}
@@ -981,6 +1004,7 @@ def _capture_viewer(frame, directory: Path, navigation: dict | None = None) -> t
         "viewer_wipe_input_node": inputs["B"][1],
         "viewer_inputs_known": window is not None,
         "viewer_process": process,
+        "viewer_display": display,
         "view": view,
         "image_width": width,
         "image_height": height,

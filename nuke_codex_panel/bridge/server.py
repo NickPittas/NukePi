@@ -19,16 +19,18 @@ from ..runtime_paths import RuntimePathError, private_runtime_directory
 from ..tools import PythonExecutor, diff_snapshots, get_context, graph_snapshot
 from ..tools.guided import GuidedNuke
 from . import api_recovery
+from . import question_gate
 from . import control as control_module
 from .control import ControlRefused
-from .inspection import CONTEXT, SCREENSHOT, InspectionGate, normalize_client_id
+from .inspection import InspectionGate, normalize_client_id
 
-# Evidence kind for a captured image that is not a graph-checkpoint screenshot.
+# Evidence kind for a captured image delivered to the workflow.
 RENDER = "render"
 ROOT_KEY = "<root>"
 MAX_PENDING_EVIDENCE = 256
 # python_executor reports at most this many modified nodes; a full list cannot prove the rest.
 MODIFIED_NODES_CAP = 50
+READ_ONLY_ACTIONS = frozenset({"render", "view", "sample", "inspect"})
 
 
 class NukeBridgeServer(QtCore.QObject):
@@ -133,7 +135,7 @@ class NukeBridgeServer(QtCore.QObject):
         return operation.control_id if operation is not None and operation.control_id else client_id
 
     def _on_control_event(self, event: dict) -> None:
-        """Control transitions: retired/revoked clients lose their per-client checkpoint state."""
+        """Control transitions: retired/revoked clients lose their pending deliveries and workflow state."""
         kind = event.get("event")
         if kind in ("retired", "revoked"):
             for client_id in event.get("clients") or ():
@@ -142,6 +144,9 @@ class NukeBridgeServer(QtCore.QObject):
                     del self._evidence_tokens[token]
         if kind == "revoked":
             # The session ended: its workflow state goes too. A mere intervention keeps it.
+            self.guided.forget_client(event["control_id"])
+        elif kind == "conversation_reset":
+            # New chat on the same control: the old conversation's workflow, scope and evidence are not this one's.
             self.guided.forget_client(event["control_id"])
         self.operation_event.emit(event)
 
@@ -211,6 +216,10 @@ class NukeBridgeServer(QtCore.QObject):
         except RuntimeError:
             self._drop_socket(socket)
 
+    def request_local(self, request: dict) -> dict:
+        """Serve one request from inside the Nuke process (same token, admission and control path as the socket)."""
+        return self._handle_request(request)
+
     def _handle_request(self, request: dict) -> dict:
         if not hmac.compare_digest(str(request.get("token", "")), self.token):
             return {"success": False, "error": "Unauthorized Nuke bridge request"}
@@ -224,7 +233,7 @@ class NukeBridgeServer(QtCore.QObject):
             "execute_action": lambda: self._execute_action(client_id, params),
             "workflow": lambda: self._workflow(client_id, params),
             "get_context": lambda: self._get_context(client_id, params),
-            "capture_screenshot": lambda: self._capture_screenshot(client_id, params),
+            "capture_screenshot": lambda: self._capture_screenshot_request(client_id, params),
             "confirm_delivery": lambda: self._confirm_delivery(client_id, params),
             "api_docs_begin": lambda: self._api_docs_begin(client_id, params),
             "images_delivered": lambda: self._images_delivered(
@@ -254,23 +263,43 @@ class NukeBridgeServer(QtCore.QObject):
             return refusal.response()
         with operation:
             try:
-                response = handler()
+                gated = self._question_gate_refusal(operation, str(method), params)
+                changes = gated is None and question_gate.is_scene_change(str(method), params, self._node_class)
+                response = gated if gated is not None else handler()
+                if changes and response.get("graph_changed") is not False:
+                    self.control.note_scene_change(operation.control_id)
             except ControlRefused as refusal:
                 response = refusal.response()
             operation.finish(bool(response.get("success")), response.get("error_code"))
         return response
 
-    def _inspection(
-        self, client_id: str, revision: int, assume=(), note: str | None = None, changed=()
-    ) -> dict:
-        """Compact checkpoint status for a result; ``assume`` counts this result's own evidence."""
-        missing = self.gate.missing(client_id, revision, assume)
-        status = {"satisfied": not missing, "missing": missing}
+    def _question_gate_refusal(self, operation, method: str, params: dict) -> dict | None:
+        """The refusal for a scene change while the ask-before-further-changes gate is armed, else None.
+
+        Runs after control admission and before any approval dialog, graph access or code, so a refused
+        request costs the person nothing and leaves the graph untouched.
+        """
+        gate = self.control.question_gate(operation.control_id)
+        if gate is None:
+            return None
+        if not question_gate.is_scene_change(method, params, self._node_class):
+            return None
+        return question_gate.refusal(gate)
+
+    def _node_class(self, name: str):
+        """The class of a live node by name, or None."""
+        return (self.guided.facts.node(name) or {}).get("class")
+
+    @staticmethod
+    def _attach_inspection(response: dict, note: str | None = None, changed=()) -> None:
+        """Add ``inspection`` only when it carries real information: a note, or changes made by others."""
+        status = {}
         if note:
             status["note"] = note
         if changed:
             status["changed_since_last_seen"] = list(changed)
-        return status
+        if status:
+            response["inspection"] = status
 
     @staticmethod
     def _recheck() -> None:
@@ -309,6 +338,14 @@ class NukeBridgeServer(QtCore.QObject):
         if result.get("graph_changed") is not False:
             self.gate.graph_may_have_changed()
             self.guided.invalidate(None, "python")
+        if result.get("graph_changed") is True:
+            # Diagnostics only: raw Python's actual delta is not ownership of those nodes.
+            self.guided.engine.record_python_delta(
+                self._guided_key(client_id),
+                result.get("added_nodes"),
+                result.get("removed_nodes"),
+                result.get("modified_nodes"),
+            )
         result["graph_revision"] = self.gate.revision
         return result
 
@@ -356,6 +393,17 @@ class NukeBridgeServer(QtCore.QObject):
             return set()
         return {ROOT_KEY if str(name) in ("root", ROOT_KEY) else str(name) for name in values}
 
+    @staticmethod
+    def _in_scope(name: str, declared: set) -> bool:
+        """True for a declared node or a node inside one: the full name or one of its dot-separated
+        ancestors (a group/gizmo containing it) is declared. A shared name prefix is not ancestry."""
+        while True:
+            if name in declared:
+                return True
+            name, dot, _ = name.rpartition(".")
+            if not dot:
+                return False
+
     def _execute_action(self, client_id: str, params: dict) -> dict:
         """One bounded nuke_action: GuidedNuke does the native work, this adds the bridge conventions."""
         description = self.guided.approval_text(params)
@@ -375,7 +423,6 @@ class NukeBridgeServer(QtCore.QObject):
                 params,
                 before.revision,
                 self._capture_for_action(client_id, captures, side_effects),
-                missing_inspection=self.gate.missing(client_id, before.revision),
             )
             if not isinstance(outcome, dict):
                 raise TypeError("nuke_action produced %s, not a result object" % type(outcome).__name__)
@@ -386,9 +433,21 @@ class NukeBridgeServer(QtCore.QObject):
         after = self.gate.observe()
         meta = diff_snapshots(before.snapshot, after.snapshot)
         changed = list(meta["added_nodes"]) + list(meta["removed_nodes"]) + list(meta["modified_nodes"])
-        allowed = self._node_names(outcome.get("touched_nodes")) | side_effects
+        declared = self._node_names(outcome.get("touched_nodes")) | side_effects
         verified = meta["graph_changed"] is not None and len(meta["modified_nodes"]) < MODIFIED_NODES_CAP
-        outside = sorted(name for name in changed if name not in allowed) if meta["graph_changed"] is not None else []
+        outside = (
+            sorted(name for name in changed if not self._in_scope(name, declared))
+            if meta["graph_changed"] is not None
+            else []
+        )
+        # A read-only action cannot edit nodes; existing nodes whose fingerprint moved while it evaluated the
+        # graph (first evaluation of an OFX/Read node updates derived knobs) are reported as such. Added or
+        # removed nodes are never excused, and every other action keeps full out-of-scope detection.
+        action_name = params.get("action")
+        evaluation = []
+        if action_name in READ_ONLY_ACTIONS:
+            evaluation = [name for name in outside if name in meta["modified_nodes"]]
+            outside = [name for name in outside if name not in evaluation]
         response = {key: value for key, value in outcome.items() if key != "delivery_token"}
         success = bool(outcome.get("success")) and failure is None
         response["graph_changed"] = meta["graph_changed"]
@@ -399,25 +458,57 @@ class NukeBridgeServer(QtCore.QObject):
         }
         response["change_detection"] = meta["graph_change_detection"]
         response["node_errors"] = meta["node_errors"]
+        if evaluation:
+            response["evaluation_derived_updates"] = {
+                "nodes": evaluation,
+                "note": (
+                    "%s only reads/evaluates; these existing nodes' knob values changed while it evaluated them "
+                    "(e.g. first evaluation of an OFX or Read node). Reported, not an out-of-scope edit." % action_name
+                ),
+            }
+        # The action may provisionally claim it changed the graph; only the before/after fingerprint decides.
+        attempted = outcome.get("partial") is not None and not outcome.get("rolled_back")
+        if not success and not outcome.get("rolled_back"):
+            if meta["graph_changed"] is True:
+                response["partial"] = (
+                    "the action changed the graph before it failed; nothing was rolled back or replayed. "
+                    "`changes` and the readback in this result (applied, knobs, inputs, connected) are the state "
+                    "that exists now; touched_nodes names the node(s) it was working on"
+                )
+            elif attempted and meta["graph_changed"] is None:
+                response["partial"] = (
+                    "the action attempted a change before it failed, but the graph fingerprint failed, so whether "
+                    "anything changed is UNKNOWN; nothing was rolled back or replayed. Treat only the readback in "
+                    "this result (applied, knobs, inputs, connected) as observed; touched_nodes names the node(s) "
+                    "it was working on"
+                )
+            elif attempted:
+                response.pop("partial", None)  # fingerprint: nothing changed
         if outside:
             success = False
             response["outside_scope_changes"] = outside
             response["rolled_back"] = False
-            response["error"] = (
-                "outside_scope: this action changed nodes it did not declare: %s. These changes happened and "
-                "were NOT rolled back. Inspect the graph before doing anything else." % ", ".join(outside[:10])
+            message = (
+                "outside_scope: this action also changed nodes it did not declare: %s. Those changes happened "
+                "and were NOT rolled back; they are listed in outside_scope_changes and changes."
+                % ", ".join(outside[:10])
             )
+            if outcome.get("error"):
+                message += " The action itself also reported: %s" % outcome["error"]
+            response["error"] = message
             self.guided.invalidate(self._guided_key(client_id), "outside_scope")
         elif success and meta["node_errors"]:
-            success = False
-            response["error"] = "Action ran, but nodes report errors: " + ", ".join(
-                entry["node"] for entry in meta["node_errors"]
+            # The requested operation completed and is verified; the error state is a diagnostic of the
+            # resulting image/channels (a missing input or channel, for example), not a failed operation.
+            response["node_errors_note"] = (
+                "the operation completed and its changes are recorded; these nodes report an error state "
+                "(for example a missing input or channel) that affects their image: "
+                + ", ".join(entry["node"] for entry in meta["node_errors"])
             )
         if not verified and meta["graph_changed"] is not None:
             response["scope_verified"] = False
         response["success"] = success
         response["graph_revision"] = after.revision
-        response["inspection"] = self._inspection(client_id, after.revision, changed=after.changed)
         if before.changed:
             response["changed_since_last_seen"] = list(before.changed)
         if captures:
@@ -429,13 +520,10 @@ class NukeBridgeServer(QtCore.QObject):
         return response
 
     def _workflow(self, client_id: str, params: dict) -> dict:
-        """One nuke_workflow call: read-only workflow state; graph evidence comes from this client's checkpoint."""
+        """One nuke_workflow call: read-only workflow state."""
         observation = self.gate.observe()
-        missing = self.gate.missing(client_id, observation.revision)
         try:
-            outcome = self.guided.workflow(
-                self._guided_key(client_id), params, observation.revision, missing_inspection=missing
-            )
+            outcome = self.guided.workflow(self._guided_key(client_id), params, observation.revision)
             if not isinstance(outcome, dict):
                 raise TypeError("nuke_workflow produced %s, not a result object" % type(outcome).__name__)
         except Exception as exc:
@@ -447,7 +535,7 @@ class NukeBridgeServer(QtCore.QObject):
         response = {key: value for key, value in outcome.items() if key != "delivery_token"}
         response["graph_changed"] = False
         response["graph_revision"] = observation.revision
-        response["inspection"] = self._inspection(client_id, observation.revision, changed=observation.changed)
+        self._attach_inspection(response, None, observation.changed)
         return response
 
     def _get_context(self, client_id: str, params: dict) -> dict:
@@ -457,16 +545,20 @@ class NukeBridgeServer(QtCore.QObject):
         context = get_context(include_nodes)
         observation = self.gate.observe()
         response = {"success": True, "context": context, "graph_revision": observation.revision}
-        assume = ()
+        # Read-only, factual, fetched on demand: nothing here prompts the model or triggers a check.
+        try:
+            report = self.guided.engine.completion_report(self._guided_key(client_id))
+        except Exception as exc:
+            response["operation_report_error"] = "%s: %s" % (type(exc).__name__, exc)
+        else:
+            if report.get("nodes"):
+                response["operation_report"] = report
         note = None
         if not include_nodes:
-            note = "include_nodes=false does not satisfy the checkpoint"
+            note = "include_nodes=false: the node list was not read"
         elif not observation.certified:
-            note = "the graph could not be fingerprinted; this result cannot satisfy the checkpoint"
-        else:
-            response["delivery_token"] = self.gate.issue_delivery(client_id, CONTEXT, observation.revision)
-            assume = (CONTEXT,)
-        response["inspection"] = self._inspection(client_id, observation.revision, assume, note, observation.changed)
+            note = "the graph could not be fingerprinted; graph_revision cannot be compared with others"
+        self._attach_inspection(response, note, observation.changed)
         return response
 
     @staticmethod
@@ -506,7 +598,6 @@ class NukeBridgeServer(QtCore.QObject):
         metadata = capture_metadata(path)
         response = {"success": True, **metadata, "path": str(path), "graph_revision": before.revision}
         note = None
-        assume = ()
         changed = before.changed
         if target == "nodegraph":
             complete = (
@@ -515,23 +606,38 @@ class NukeBridgeServer(QtCore.QObject):
                 and metadata.get("graph_group") == "root"
             )
             if not complete:
-                note = "this nodegraph capture is not a complete all-scope root view and cannot satisfy the checkpoint"
+                note = "this nodegraph capture is not a complete all-scope root view"
             elif not before.certified:
-                note = "the graph could not be fingerprinted; this capture cannot satisfy the checkpoint"
+                note = "the graph could not be fingerprinted; graph_revision cannot be compared with others"
             else:
-                # Rendering the view can pump events; the picture only counts for the
-                # revision it was started at if the graph is still exactly that.
+                # Rendering the view can pump events; report it if the graph moved meanwhile.
                 after = self.gate.observe()
                 response["graph_revision"] = after.revision
-                if after.certified and after.revision == before.revision:
-                    response["delivery_token"] = self.gate.issue_delivery(
-                        client_id, SCREENSHOT, before.revision
-                    )
-                    assume = (SCREENSHOT,)
-                else:
+                if not after.certified or after.revision != before.revision:
                     note = "the graph changed while the view was captured; capture it again"
                     changed += after.changed
-        response["inspection"] = self._inspection(client_id, response["graph_revision"], assume, note, changed)
+        self._attach_inspection(response, note, changed)
+        return response
+
+    def _capture_screenshot_request(self, client_id: str, params: dict) -> dict:
+        """A capture_nuke_screenshot call. A Viewer render joins the same evidence/delivery lifecycle as a
+        nuke_action render: provisional until the sidecar confirms the image really reached the model.
+
+        (nuke_action renders call ``_capture_screenshot`` through ``_capture_for_action``, which registers its
+        own evidence; they never come through here, so nothing is registered twice.)
+        """
+        response = self._capture_screenshot(client_id, params)
+        if not response.get("success") or str(params.get("target", "viewer")) != "viewer":
+            return response
+        # Rendering can touch the graph (Viewer state): the evidence belongs to the graph as it is afterwards.
+        after = self.gate.observe()
+        response["graph_revision"] = after.revision
+        token = self.gate.issue_delivery(client_id, RENDER, after.revision)
+        response["evidence_id"] = secrets.token_hex(8)
+        self._evidence_tokens[token] = (client_id, dict(response))
+        while len(self._evidence_tokens) > MAX_PENDING_EVIDENCE:
+            self._evidence_tokens.popitem(last=False)
+        response["delivery_token"] = token
         return response
 
     def _confirm_delivery(self, client_id: str, params: dict) -> dict:
@@ -542,13 +648,15 @@ class NukeBridgeServer(QtCore.QObject):
         recorded = []
         delivered = []
         failure = None
+        notice = None
+        composite = network = None
         for token in tokens:
             try:
                 recorded.append(self.gate.confirm_delivery(client_id, token))
             except KeyError:
                 failure = {
                     "success": False,
-                    "error": "Unknown, repeated, or foreign delivery token; the checkpoint was not satisfied by it",
+                    "error": "Unknown, repeated, or foreign delivery token; it was not recorded",
                     "recorded": recorded,
                 }
                 break
@@ -561,7 +669,7 @@ class NukeBridgeServer(QtCore.QObject):
             current = self.gate.observe()
             for evidence in delivered:
                 try:
-                    self.guided.evidence_delivered(self._guided_key(client_id), evidence, current.revision)
+                    record = self.guided.evidence_delivered(self._guided_key(client_id), evidence, current.revision)
                 except Exception as exc:
                     failure = failure or {
                         "success": False,
@@ -569,9 +677,33 @@ class NukeBridgeServer(QtCore.QObject):
                         % (type(exc).__name__, exc),
                         "recorded": recorded,
                     }
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                composite = composite or record.get("complete_composite")
+                network = network or record.get("complete_network")
+            # An RGB render of the complete composite asks; otherwise a review of any node of the complete network
+            # first requires that composite render (the gate's "review" stage).
+            if composite:
+                notice = self._arm_question_gate(composite, "ask")
+            elif network:
+                notice = self._arm_question_gate(network, "review")
         if failure is not None:
             return failure
-        return {"success": True, "recorded": recorded, "graph_revision": self.gate.revision}
+        response = {"success": True, "recorded": recorded, "graph_revision": self.gate.revision}
+        if notice is not None:
+            response["question_gate_notice"] = notice
+        return response
+
+    def _arm_question_gate(self, composite: dict, stage: str) -> str | None:
+        """Arm or advance the gate for this control; the notice to show the model, or None.
+
+        None when the control's harness cannot ask the person a question, or the gate is already at that stage.
+        """
+        operation = control_module.current_operation()
+        if operation is None or not self.control.arm_question_gate(operation.control_id, composite, stage):
+            return None
+        return question_gate.armed_notice(composite) if stage == "ask" else question_gate.review_notice(composite)
 
     def _api_docs_begin(self, client_id: str, params: dict) -> dict:
         """Where the installed Nuke documentation lives; the sidecar reads it, never Nuke's GUI thread."""

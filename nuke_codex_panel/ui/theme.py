@@ -17,7 +17,7 @@ Selectors available to plug-in widgets:
 
 from __future__ import annotations
 
-from PySide6 import QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 PALETTE = {
     "bg": "#171a21",
@@ -191,15 +191,32 @@ def _palette() -> QtGui.QPalette:
 
 
 _STYLE_MARKER = "_nukeCodexPanelStyled"
-_plugin_style: QtWidgets.QStyle | None = None
+_style_owner: QtCore.QObject | None = None
 
 
 def _scoped_style() -> QtWidgets.QStyle | None:
-    """One Fusion style object shared by plug-in widgets only; kept alive here (widgets do not own styles)."""
-    global _plugin_style
-    if _plugin_style is None:
-        _plugin_style = QtWidgets.QStyleFactory.create("Fusion")
-    return _plugin_style
+    """The one Fusion style shared by plug-in widgets only, as a live Python wrapper.
+
+    Qt owns the C++ style: it is a child of a private QObject that nothing themed refers to, so it
+    lives as long as the process (widgets keep only a raw pointer and never own their style).
+
+    The wrapper is deliberately NOT cached. ``QWidget.setStyle`` makes each widget wrapper refer to
+    the wrapper it was given, and Shiboken invalidates everything a wrapper refers to when that
+    wrapper is invalidated (e.g. the temporary wrapper of ``QApplication.activeWindow()`` dies and
+    takes the dialog wrapper parented to it along). A cached wrapper would then raise "Internal C++
+    object already deleted" for the next themed widget although the style itself is alive; asking
+    the owner returns a new wrapper for the same style whenever the old one was invalidated.
+    """
+    global _style_owner
+    if _style_owner is None:
+        _style_owner = QtCore.QObject()
+    style = _style_owner.findChild(QtWidgets.QStyle)
+    if style is None:
+        style = QtWidgets.QStyleFactory.create("Fusion")
+        if style is None:
+            return None
+        style.setParent(_style_owner)
+    return style
 
 
 def enlarged_font(font: QtGui.QFont, points: int) -> QtGui.QFont:

@@ -29,6 +29,8 @@ import os
 import threading
 import time
 
+from .question_gate import STOP_ANSWER
+
 LEGACY_CLIENT = "legacy"  # mirrors inspection.LEGACY_CLIENT: callers without an id share it
 MAX_CONTROL_ID = 64
 UNSCOPED = ""
@@ -91,6 +93,14 @@ class _State:
         self.retiring = False
         self.epoch = None
         self.operations: dict[int, "Operation"] = {}
+        # Ask-before-further-changes gate. ``question_gate`` is None while not armed, else
+        # {"composite": {...}, "stage": "review" | "ask", "stopped": bool}. It lives here, not in a sidecar or
+        # agent process, so it survives their renewal for the same control; revoke() (session ended) clears it.
+        # ``question_gate_changed``: the gate may arm again; False only from the person's answer until the next
+        # successful scene change.
+        self.question_gate_enabled = False
+        self.question_gate: dict | None = None
+        self.question_gate_changed = True
 
 
 class Operation:
@@ -255,9 +265,120 @@ class BridgeControl:
             state.retiring = True
             state.generation += 1
             state.valid_from_ns = time.monotonic_ns()
+            state.question_gate_enabled = False
+            state.question_gate = None
             status = self._status(key)
         self._emit("revoked", key, status, clients=clients)
         return status
+
+    # ---- ask-before-further-changes gate ------------------------------------------------
+    #
+    # Once a complete composite has been delivered to the model, the bridge refuses scene-changing
+    # requests of that control until the person has answered a question (or sent a message). The
+    # harness declares the control gate-capable (it has a question tool the person can answer in the
+    # panel); a control that never did, and every unscoped client, is never gated, because nobody could
+    # ever lift it. State-based only: no timer, deadline or call count.
+    def enable_question_gate(self, control_id: str) -> None:
+        """Declare that this control's harness can ask the person a question (idempotent)."""
+        key = self._scoped(control_id)
+        with self._lock:
+            self._state(key).question_gate_enabled = True
+
+    def question_gate(self, control_id) -> dict | None:
+        """The armed gate of this control (a copy), or None when it is not enabled or not armed.
+
+        ``stage`` is "review" (a complete composite exists but its RGB render was not yet delivered) or "ask"
+        (it was; the person must be asked). ``stopped`` is only ever set in the ask stage.
+        """
+        with self._lock:
+            state = self._states.get(normalize_control_id(control_id))
+            if state is None or not state.question_gate_enabled or state.question_gate is None:
+                return None
+            gate = state.question_gate
+            return {"composite": dict(gate["composite"]), "stage": gate["stage"], "stopped": gate["stopped"]}
+
+    def arm_question_gate(self, control_id: str, composite: dict, stage: str = "ask") -> bool:
+        """Arm (or advance) the gate. True only when this call changed it, so the model is told once.
+
+        "ask" arms a clear gate, or advances a "review" gate. A clear gate arms (either stage) only when the scene
+        was changed since the person last answered a question (an unchanged look at the composite right after an
+        answer must not close the gate again before any change was made); a new conversation or a person
+        message makes the next delivery arm it. Disabled/revoked: False.
+        """
+        key = normalize_control_id(control_id)
+        if key == UNSCOPED:
+            return False
+        with self._lock:
+            state = self._state(key)
+            if not state.question_gate_enabled or state.revoked:
+                return False
+            gate = state.question_gate
+            if gate is None:
+                if not state.question_gate_changed:
+                    return False
+                state.question_gate = {"composite": dict(composite), "stage": stage, "stopped": False}
+                return True
+            if stage == "ask" and gate["stage"] == "review":
+                state.question_gate = {"composite": dict(composite), "stage": "ask", "stopped": False}
+                return True
+            return False
+
+    def note_scene_change(self, control_id: str) -> None:
+        """A request of this control changed (or may have changed) the scene: a later review may re-arm the gate."""
+        key = normalize_control_id(control_id)
+        if key != UNSCOPED:
+            with self._lock:
+                self._state(key).question_gate_changed = True
+
+    def reset_conversation(self, control_id: str) -> None:
+        """A fresh conversation starts on this control (New chat): the old one's gate and bridge state are over.
+
+        Clears the armed gate (the harness stays gate-capable) and emits ``conversation_reset`` so the
+        bridge drops the control's workflow, scope and evidence. A same-conversation renewal never calls this.
+        """
+        key = self._scoped(control_id)
+        with self._lock:
+            state = self._state(key)
+            state.question_gate = None
+            state.question_gate_changed = True
+            status = self._status(key)
+        self._emit("conversation_reset", key, status)
+
+    def question_answered(self, control_id: str, answers) -> str | None:
+        """The person completed an ask_user call with these answers (selection titles / typed text).
+
+        Returns "stopped", "released" or None (gate not armed, or no answer). "Stop here" among the answers,
+        or an earlier "Stop here", keeps the gate armed until the person's next message (the run must end,
+        not carry on); any other answer is the person's direction to continue, so the gate lifts until the
+        next delivered review. Comments and navigation stages are never passed in.
+        """
+        texts = [str(item).strip().lower() for item in (answers or ()) if str(item).strip()]
+        if not texts:
+            return None
+        key = normalize_control_id(control_id)
+        with self._lock:
+            state = self._states.get(key)
+            if state is None or state.question_gate is None:
+                return None
+            if state.question_gate["stopped"] or any(text.startswith(STOP_ANSWER) for text in texts):
+                state.question_gate["stopped"] = True
+                return "stopped"
+            state.question_gate = None
+            state.question_gate_changed = False
+            return "released"
+
+    def person_message(self, control_id: str) -> bool:
+        """The person sent a new message: it is their direction, so the gate lifts. True when it was armed."""
+        key = normalize_control_id(control_id)
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return False
+            state.question_gate_changed = True  # the person's own direction: the next delivery may arm the gate
+            if state.question_gate is None:
+                return False
+            state.question_gate = None
+            return True
 
     def status(self, control_id: str) -> dict:
         """{"control_id","paused","revoked","generation","active_operations","operations":[...]}"""

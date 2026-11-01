@@ -1,14 +1,14 @@
 # Research: existing Pi extensions before custom building (2026-10-29)
 
-Purpose: decide REUSE / CUSTOMIZE / REFERENCE / DEFER / REJECT for web search/fetch, `/btw`-style steering, and small Pi utilities, before any custom extension work. Plan linkage: [PLAN-pi-runtime.md](PLAN-pi-runtime.md), [ARCHITECTURE-pi-runtime.md](ARCHITECTURE-pi-runtime.md), [INTEGRATION-pi-runtime.md](INTEGRATION-pi-runtime.md).
+Purpose: record REUSE / CUSTOMIZE / REFERENCE / DEFER / REJECT decisions for Pi extensions before custom building. The original web, manual-steering and utility research is retained below; the separately authorised ask-user installation and live exercise are recorded in section 4.
 
 ## Evidence status
 
-- **Source-read only.** Findings come from small read-only scout agents reading primary repos/docs and the installed Pi 1.4.0 tree (`~/.pi/agent/install/releases/1.4.0/node_modules/@earendil-works/pi-coding-agent/`). The scouts read the source files; the parent read only the READMEs of `nicobailon/pi-web-access` and `nicknisi/pi-extensions/packages/btw`, not their source.
-- **Nothing here was installed, run, or tested against Pi 1.4.0 / our RPC / codemode / live Nuke.** Every compatibility statement is **UNTESTED**. Line numbers refer to the versions named and may drift.
+- **Original web, manual-steering and utility candidates: source-read only.** Small read-only scouts inspected primary repositories/docs and the installed Pi 1.4.0 tree. These candidates were not installed or exercised through the panel; their compatibility remains **UNTESTED**.
+- **Ask-user: separately authorised and installed.** The pinned candidate in section 4 has been exercised through the private Pi 1.4.0 RPC client and the real Nuke panel on Linux. This does not establish compatibility for the other candidates.
 - Popularity (stars, downloads) is not evidence of quality and is not used.
 - Absence statements mean "not found among the reviewed candidates", not "none exists".
-- Installation gates, in order: (a) source/license/pin/private-auth/cost review BEFORE any authorized private candidate installation; (b) the Pi 1.4 / RPC / codemode / live-Nuke feature gate in INTEGRATION BEFORE production adoption. **No installation is authorized now.**
+- Installation requires source/license/pin/private-auth/cost review before an explicitly authorised private installation, followed by a real integrated Nuke exercise. The user authorised the ask-user installation; this is not permission to install the web or manual-steering candidates.
 
 ## Reuse-first rule
 
@@ -73,6 +73,16 @@ Conclusion: among the reviewed, none is a safe full Nuke manual-steering solutio
 | Auth packages | NONE adopted | Reuse `ModelRuntime`/`AuthInteraction` SDK auth. RPC has no native `/login`; do not claim it. |
 | Session export | REUSE SDK | `exportSessionToJsonl` exists; HTML export is TUI-renderer-based. Not a new feature merely because an example exists. |
 | `truncated-tool.ts`, summarize/todo/games/etc. | REJECT | No Nuke relevance; truncation utilities importable directly. |
+
+## 4. In-app questions — REUSE pi-ask-user 0.17.1
+
+- Catalogue: [pi-ask-user](https://pi.dev/packages/pi-ask-user); source: [edlsh/pi-ask-user](https://github.com/edlsh/pi-ask-user); npm pin: **`pi-ask-user@0.17.1`**, MIT. Reviewed its published source and licence before installation. It has no regular dependencies; its Pi/TUI/TypeBox peers are satisfied by the private runtime and its loader aliases.
+- Chosen because the existing `ask_user` tool falls back from the terminal UI to RPC `select` and `input`. That supports option buttons and a custom typed answer without inventing another question tool. A batch or custom-answer follow-up can contain several dialogs inside one invocation.
+- Rejected alternatives: `skidvis/pi-ask-user-question` auto-proceeds in RPC mode; the reviewed `devkade` candidate was terminal-only with no licence found; a larger extension bundle brought unrelated capabilities.
+- Installed only with the plugin's private Node/npm, an exact lockfile pin and `--ignore-scripts`. The runtime manifest records the version, integrity, entry and tool name. The extension is loaded explicitly; its bundled skill is not auto-loaded, and global discovery remains disabled. Pi 1.4.0 and Node 26.12.0 were not replaced.
+- Reviewed package source contains no network, subprocess or auxiliary model calls. The ordinary agent turn still uses its selected model. The owned runtime guard refuses question timeouts and nested question calls; the panel waits for an answer instead of inventing a default.
+- The Qt client is the missing glue: real select/input cards, one RPC answer, and the existing cancellation/steering barrier. It holds the agent's bridge control for the whole question invocation and waits for admitted operations to drain before accepting an answer.
+- **Observed in normal Nuke on Linux:** a model-created Grade returned its purpose treatment; Alpha/RGB/custom choices appeared in-app; a typed `RGB output` answer resumed the same tool call and received one short acknowledgement. A second question was cancelled, the run aborted and reconnected to the same conversation, with no queued continuation observed. Other platforms and stale-process races were not exercised by this run.
 
 ## Plan impact
 

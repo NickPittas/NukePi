@@ -24,6 +24,7 @@ MAX_LIST = 25
 MAX_CHOICES = 40
 MAX_FRAMES = 3
 MAX_PLACEMENTS = 16
+MAX_ARRANGE = 40
 MAX_KEYS = 200
 MAX_CODE = 6000
 MAX_OUTPUT = 2000
@@ -61,6 +62,10 @@ _STRING_CLASSES = frozenset(
     {"String_Knob", "EvalString_Knob", "File_Knob", "Multiline_Eval_String_Knob", "Channel_Knob", "ChannelMask_Knob", "Input_Knob"}
 )
 _FROM_USER_TEXT_CLASSES = frozenset({"Read", "DeepRead"})
+_COPY_CLASSES = frozenset({"Copy", "ShuffleCopy"})
+_SHUFFLE_COPY_SELECTORS = ("in", "in2", "out", "out2")
+# Nuke reads the bare standard names back for the rgba layer ("alpha" for rgba.alpha); compare them as the full channel.
+_STANDARD_CHANNELS = {"red": "rgba.red", "green": "rgba.green", "blue": "rgba.blue", "alpha": "rgba.alpha"}
 
 _INTERPOLATIONS = {
     "smooth": "SMOOTH",
@@ -145,6 +150,20 @@ def _pair(value, label: str) -> tuple[float, float]:
 # ---------------------------------------------------------------------------------
 
 
+def layout_fact(node) -> dict:
+    """Plain layout fact of one live node: name, class, inputs, position and its real screen bounds (None when unreadable)."""
+    inputs = []
+    for index in range(node.inputs()):
+        source = node.input(index)
+        inputs.append(source.fullName() if source is not None else None)
+    fact = {"name": node.fullName(), "class": node.Class(), "inputs": inputs, "x": node.xpos(), "y": node.ypos()}
+    try:
+        fact["width"], fact["height"] = int(node.screenWidth()), int(node.screenHeight())
+    except Exception:
+        fact["width"] = fact["height"] = None
+    return fact
+
+
 class NukeFacts:
     """Read-only live graph facts (implements ``guided_workflow.GraphFacts``)."""
 
@@ -166,12 +185,43 @@ class NukeFacts:
             "label": None,
             "operation": None,
         }
+        try:
+            fact["width"], fact["height"] = int(node.screenWidth()), int(node.screenHeight())
+        except Exception:
+            fact["width"] = fact["height"] = None
         knobs = node.knobs()
         if "label" in knobs:
             fact["label"] = knobs["label"].value()
         if node.Class() == "Merge2" and "operation" in knobs:
             fact["operation"] = knobs["operation"].value()
         return fact
+
+    def layout_nodes(self, names):
+        """Layout facts of the named nodes that still exist (missing names are skipped)."""
+        nuke = _nuke()
+        out = []
+        for name in names:
+            node = nuke.toNode(name) if isinstance(name, str) else None
+            if node is not None:
+                out.append(layout_fact(node))
+        return out
+
+    def root_nodes(self):
+        """``[{name, class, inputs:[name|None]}]`` for every root-level node (nodes inside groups are not listed)."""
+        nuke = _nuke()
+        out = []
+        for node in nuke.allNodes(group=nuke.root()):
+            out.append(
+                {
+                    "name": node.fullName(),
+                    "class": node.Class(),
+                    "inputs": [
+                        node.input(index).fullName() if node.input(index) is not None else None
+                        for index in range(node.inputs())
+                    ],
+                }
+            )
+        return out
 
     def upstream(self, name):
         nuke = _nuke()
@@ -250,6 +300,34 @@ class NukeFacts:
             return None
         return hashlib.sha1(json.dumps(sorted(snapshot.items())).encode("utf-8")).hexdigest()
 
+    def content_digest(self):
+        """Fingerprint of what produces images, for report currentness; NOT the mutation digest.
+
+        Same per-node hashing as ``graph_snapshot`` (class, wiring, every knob's script form, animation) over every
+        node and Root, but Viewer nodes (their input and display state are inspection state) and node positions
+        are left out, so viewing or arranging does not make earlier evidence look stale. None when unreadable.
+        """
+        nuke = _nuke()
+        from .python_executor import _stable_script
+
+        positions = frozenset({"xpos", "ypos"})
+        try:
+            parts = []
+            for node in nuke.allNodes(group=nuke.root(), recurseGroups=True):
+                if node.Class() == "Viewer":
+                    continue
+                inputs = []
+                for index in range(node.inputs()):
+                    source = node.input(index)
+                    inputs.append(source.fullName() if source is not None else "")
+                payload = "%s|%s|%s" % (node.Class(), inputs, _stable_script(node, exclude_knobs=positions))
+                parts.append((node.fullName(), hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()))
+            parts.sort()
+            parts.append(("<root>", hashlib.sha1(_stable_script(nuke.root()).encode("utf-8", "replace")).hexdigest()))
+            return hashlib.sha1(json.dumps(parts).encode("utf-8")).hexdigest()
+        except Exception:
+            return None
+
 
 def _roto_elements(layer):
     for element in layer:
@@ -282,13 +360,13 @@ class NativeActions:
     """Runs one action on Nuke's main thread. ``capture`` is the bridge's synchronous capture."""
 
     ALLOWED = {
-        "create": {"class", "name", "knobs", "inputs", "place", "select"},
+        "create": {"class", "name", "knobs", "inputs", "place", "select", "purpose"},
         "select": {"nodes"},
-        "inspect": {"node", "knobs", "match", "non_default"},
+        "inspect": {"node", "knobs", "match", "non_default", "purpose"},
         "set": {"node", "knobs"},
         "connect": {"node", "inputs"},
         "swap": {"node", "a", "b"},
-        "layout": {"placements"},
+        "layout": {"placements", "arrange", "nodes", "output"},
         "project": {"width", "height", "pixel_aspect", "format_name", "fps", "first_frame", "last_frame", "allow_overwrite", "reason"},
         "sample": {"node", "x", "y", "frame", "size", "channels"},
         "render": {"node", "frame", "frames", "target", "zoom", "center", "region"},
@@ -305,6 +383,9 @@ class NativeActions:
         self.facts = facts
         self.mutated = False
         self.touched: list[str] = []
+        # Set by GuidedNuke: name -> the recorded node use of this client; selected treatments found this action.
+        self.stored_use = None
+        self.node_uses: list[dict] = []
 
     def touch(self, name: str) -> None:
         if name not in self.touched:
@@ -393,7 +474,9 @@ class NativeActions:
             info["error_query_failed"] = "%s: %s" % (type(exc).__name__, exc)
         if node.Class() in ("Merge", "Merge2"):
             info["ports"] = "0=B (background), 1=A (foreground)"
-        info.update(self._media_facts(node))
+        copy = self._copy_state(node)
+        if copy:
+            info["copy"] = copy
         return info
 
     @staticmethod
@@ -417,6 +500,75 @@ class NativeActions:
         except Exception as exc:
             facts["format_error"] = "%s: %s" % (type(exc).__name__, exc)
         return facts
+
+    @staticmethod
+    def _channel_facts(source):
+        """(facts, channel set) for the channels ``source`` reports now; explicit unknown (set None) when the query fails."""
+        try:
+            names = [name for name in source.channels() if isinstance(name, str)]
+        except Exception as exc:
+            return {"channels": "unknown", "channels_error": "%s: %s" % (type(exc).__name__, exc)}, None
+        layers = []
+        for name in names:
+            layer = name.split(".", 1)[0]
+            if layer not in layers:
+                layers.append(layer)
+        alpha = [name for name in names if name.endswith(".alpha")]
+        facts = {"layers": layers[:MAX_LIST], "alpha": alpha[:MAX_LIST], "has_alpha": bool(alpha)}
+        if len(layers) > MAX_LIST:
+            facts["layers_total"] = len(layers)
+        return facts, set(names)
+
+    def _copy_state(self, node) -> dict:
+        """Actual per-input identity/channels and from/to selectors of a Copy/ShuffleCopy, read back now ({} for other nodes)."""
+        if node.Class() not in _COPY_CLASSES:
+            return {}
+        channel_sets = {}
+        inputs = []
+        for index in range(node.inputs()):
+            source = node.input(index)
+            entry = {"index": index, "node": source.fullName() if source is not None else None}
+            if source is not None:
+                facts, names = self._channel_facts(source)
+                entry.update(facts)
+                channel_sets[index] = names
+            inputs.append(entry)
+
+        def selector(knob):
+            try:
+                return knob.value()
+            except Exception as exc:
+                return "unknown (%s: %s)" % (type(exc).__name__, exc)
+
+        state = {"inputs": inputs}
+        if node.Class() == "Copy":
+            pairs = []
+            for pair in range(8):
+                source_knob, target_knob = node.knob("from%d" % pair), node.knob("to%d" % pair)
+                if source_knob is None or target_knob is None:
+                    break
+                entry = {"pair": pair, "from": selector(source_knob), "to": selector(target_knob)}
+                if entry["from"] not in ("none", "") and not entry["from"].startswith("unknown ("):
+                    entry["from_in_inputs"] = {
+                        str(index): (None if names is None else _STANDARD_CHANNELS.get(entry["from"], entry["from"]) in names)
+                        for index, names in channel_sets.items()
+                    }
+                pairs.append(entry)
+            state["pairs"] = pairs
+        else:
+            state["selectors"] = {
+                name: selector(node.knob(name)) for name in _SHUFFLE_COPY_SELECTORS if node.knob(name) is not None
+            }
+        output, _ = self._channel_facts(node)
+        state["output"] = output
+        state["note"] = (
+            "A supplies the copied channel; B keeps its other channels and receives it. Python does not expose Copy "
+            "port labels, so input indices are NOT mapped to A/B here: take that from the node's port labels. "
+            "from_in_inputs (true/false/null=unknown) shows which connected input carries each selected channel; a "
+            "missing channel or an all-black alpha is a clue, not proof of swapped inputs: sample the relevant "
+            "alpha of each input (sample channels=[\"rgba.alpha\"])."
+        )
+        return state
 
     def _knob(self, node, name):
         knob = node.knob(name)
@@ -871,6 +1023,7 @@ class NativeActions:
         for key in ("knobs", "inputs", "place"):
             if args.get(key) is not None and not isinstance(args[key], dict):
                 raise ActionError("%s must be an object" % key)
+        purpose = self._purpose_arg(args)
         if args.get("inputs"):
             # Refuse bad sources before anything is created.
             for source_name in args["inputs"].values():
@@ -945,7 +1098,11 @@ class NativeActions:
             exc.facts["recovery"] = recovery
             raise
         result.update(self._describe(node))
-        return {**self._brief(result), "graph_changed": True}
+        brief = {**self._brief(result), "graph_changed": True}
+        use = self._node_use(node, purpose, requested_class=cls)
+        if use:
+            brief["node_use"] = use
+        return brief
 
     @staticmethod
     def _brief(result):
@@ -954,7 +1111,7 @@ class NativeActions:
             for k, v in result.items()
             if k
             in (
-                "node", "class", "knobs", "connected", "position", "inputs", "input_slots", "error",
+                "node", "class", "knobs", "connected", "position", "inputs", "input_slots", "error", "copy",
                 "frame_range", "format", "frame_range_error", "format_error",
             )
         }
@@ -975,7 +1132,10 @@ class NativeActions:
         return {"selected": selected, "graph_changed": False}
 
     def _do_inspect(self, args):
+        purpose = self._purpose_arg(args)
         if args.get("node") is None:
+            if purpose is not None:
+                raise ActionError("purpose needs a node: inspect node=<name> purpose=<intended use>")
             return self._inspect_scene()
         node = self._node(args["node"])
         info = self._describe(node)
@@ -1020,7 +1180,11 @@ class NativeActions:
             info["non_default"] = changed
         if node.Class() in SHAPE_HOSTS:
             info["shapes"] = self._shape_names(node)
-        return {"inspected": info, "graph_changed": False}
+        result = {"inspected": info, "graph_changed": False}
+        use = self._node_use(node, purpose, reuse=purpose is None)
+        if use:
+            result["node_use"] = use
+        return result
 
     def _inspect_scene(self):
         nuke = _nuke()
@@ -1049,6 +1213,9 @@ class NativeActions:
         self.touch(node.fullName())
         applied = self._apply_knobs(node, args.get("knobs"))
         result = {"node": node.fullName(), "knobs": applied, "graph_changed": True}
+        copy = self._copy_state(node)
+        if copy:
+            result["copy"] = copy
         result.update(self._media_facts(node))
         return result
 
@@ -1057,7 +1224,10 @@ class NativeActions:
         self.touch(node.fullName())
         connected = self._connect_inputs(node, args.get("inputs"))
         info = self._describe(node)
-        return {"node": node.fullName(), "connected": connected, "inputs": info["inputs"], "input_slots": info["input_slots"], "graph_changed": True}
+        result = {"node": node.fullName(), "connected": connected, "inputs": info["inputs"], "input_slots": info["input_slots"], "graph_changed": True}
+        if "copy" in info:
+            result["copy"] = info["copy"]
+        return result
 
     def _do_swap(self, args):
         node = self._node(args.get("node"))
@@ -1081,7 +1251,10 @@ class NativeActions:
         if node.input(a) != source_b or node.input(b) != source_a:
             raise ActionError("inputs of %s did not swap as requested; inspect it" % node.fullName())
         info = self._describe(node)
-        return {"node": node.fullName(), "swapped": [a, b], "inputs": info["inputs"], "graph_changed": True}
+        result = {"node": node.fullName(), "swapped": [a, b], "inputs": info["inputs"], "graph_changed": True}
+        if "copy" in info:
+            result["copy"] = info["copy"]
+        return result
 
     def _do_delete(self, args):
         nuke = _nuke()
@@ -1102,6 +1275,13 @@ class NativeActions:
     # ---- layout ----
 
     def _do_layout(self, args):
+        if args.get("arrange") is not None and not isinstance(args["arrange"], bool):
+            raise ActionError("arrange must be true or false")
+        if args.get("arrange"):
+            return self._arrange(args)
+        stray = [key for key in ("nodes", "output") if args.get(key) is not None]
+        if stray:
+            raise ActionError("%s only apply with arrange=true" % " and ".join(stray))
         placements = args.get("placements")
         if not isinstance(placements, list) or not placements or len(placements) > MAX_PLACEMENTS:
             raise ActionError("placements must be a list of 1-%d {node, below|above|left_of|right_of|x+y, gap?}" % MAX_PLACEMENTS)
@@ -1116,6 +1296,260 @@ class NativeActions:
             self.touch(node.fullName())
             positions[node.fullName()] = self._place(node, spec)
         return {"positions": positions, "graph_changed": True}
+
+    def _arrange(self, args):
+        """One finite arrangement of exactly the listed nodes; real partial changes are kept and reported."""
+        from contextlib import nullcontext
+
+        from .graph_layout import DOT_PLAN, LayoutError, plan_arrangement, review_layout
+
+        nuke = _nuke()
+        if args.get("placements") is not None:
+            raise ActionError("layout takes either placements or arrange=true with nodes, not both; nothing was changed")
+        names = args.get("nodes")
+        if not isinstance(names, list) or not names or len(names) > MAX_ARRANGE or not all(isinstance(n, str) for n in names):
+            raise ActionError("arrange needs nodes: an explicit list of 1-%d node names to arrange" % MAX_ARRANGE)
+        targets = [self._node(name) for name in names]
+        full = [item.fullName() for item in targets]
+        if len(set(full)) != len(full):
+            raise ActionError("nodes lists a node more than once")
+        output = args.get("output")
+        if output is not None:
+            if not isinstance(output, str) or not output.strip():
+                raise ActionError("output must be a node name")
+            output = self._node(output, "output").fullName()
+        parents = sorted({(item.fullName().rsplit(".", 1)[0] if "." in item.fullName() else "root") for item in targets})
+        if len(parents) != 1:
+            raise ActionError(
+                "all arranged nodes must be in the same group (found %s); arrange one group at a time" % ", ".join(parents),
+                groups=parents,
+            )
+        group = nuke.root() if parents[0] == "root" else nuke.toNode(parents[0])
+        if group is None:
+            raise ActionError("the group %r of the listed nodes no longer exists" % parents[0])
+        facts = {}
+        for item in nuke.allNodes(group=group):
+            fact = layout_fact(item)
+            facts[fact["name"]] = fact
+        try:
+            plan = plan_arrangement(facts, full, output)
+        except LayoutError as exc:
+            raise ActionError("layout arrange refused: %s; nothing was changed" % exc) from exc
+
+        def group_context():
+            return nullcontext() if nuke.thisGroup().fullName() == group.fullName() else group
+
+        arranged, dots, rewired, oversize = {}, [], {}, []
+        changed = False
+        try:
+            for name in full:
+                node = nuke.toNode(name)
+                if name not in plan["positions"]:
+                    arranged[name] = {"x": node.xpos(), "y": node.ypos()}  # a listed Viewer: left in place
+                    continue
+                x, y = plan["positions"][name]
+                if (node.xpos(), node.ypos()) != (x, y):
+                    self.touch(name)
+                    self.mutated = True
+                    changed = True
+                    node.setXYpos(x, y)
+                arranged[name] = {"x": node.xpos(), "y": node.ypos()}
+
+            def make_dot(source, cx, cy):
+                self.mutated = True
+                with group_context():
+                    dot = nuke.nodes.Dot()
+                info = {"name": dot.fullName(), "input": None}
+                dots.append(info)
+                self.touch(info["name"])
+                dot.setXYpos(int(round(cx - dot.screenWidth() / 2.0)), int(round(cy - dot.screenHeight() / 2.0)))
+                dot.setInput(0, source)
+                if dot.input(0) != source:
+                    raise ActionError("the new Dot %s did not connect to %s" % (info["name"], source.fullName()))
+                info["input"] = source.fullName()
+                info["x"], info["y"] = dot.xpos(), dot.ypos()
+                if max(dot.screenWidth(), dot.screenHeight()) > DOT_PLAN:
+                    oversize.append(
+                        "Dot %s is %dx%d, larger than the %d px box the route was planned with; its clearances were not verified"
+                        % (info["name"], dot.screenWidth(), dot.screenHeight(), DOT_PLAN)
+                    )
+                return dot, info
+
+            for route in plan["routes"]:
+                upper = nuke.toNode(route["source"])
+                consumer = nuke.toNode(route["consumer"])
+                port = route["port"]
+                info = None
+                for cx, cy in route["waypoints"]:
+                    upper, info = make_dot(upper, cx, cy)
+                if not consumer.canSetInput(port, upper):
+                    raise ActionError("%s input %d cannot take the waypoint Dot %s" % (route["consumer"], port, info["name"]))
+                self.touch(route["consumer"])
+                self.mutated = True
+                consumer.setInput(port, upper)
+                if consumer.input(port) != upper:
+                    raise ActionError("%s input %d reads %r after rewiring through %s" % (route["consumer"], port, consumer.input(port), info["name"]))
+                info["feeds"] = {route["consumer"]: port}
+                rewired.setdefault(route["consumer"], {})[str(port)] = info["name"]
+                changed = True
+            changed = changed or bool(dots)
+        except ActionError as exc:
+            exc.facts.update(arranged=arranged, dots=dots, rewired=rewired, graph_changed=True if self.mutated else False)
+            raise
+        except Exception as exc:
+            raise ActionError(
+                "layout arrange stopped: %s: %s" % (type(exc).__name__, exc),
+                arranged=arranged, dots=dots, rewired=rewired, graph_changed=True if self.mutated else False,
+            ) from exc
+
+        scope = set(full) | {item["name"] for item in dots}
+        neighbours = set()
+        for name in list(scope):
+            node = nuke.toNode(name)
+            if node is not None:
+                neighbours |= {node.input(i).fullName() for i in range(node.inputs()) if node.input(i) is not None}
+        for name, fact in facts.items():
+            if name not in scope and fact.get("class") != "Viewer" and scope & set(item for item in fact["inputs"] if item):
+                neighbours.add(name)
+        review = review_layout(self.facts.layout_nodes(sorted(scope | neighbours)))
+        review["unknowns"].append(
+            "only the listed nodes, the new Dots and their direct neighbours were checked; other nodes of the group were not"
+        )
+        unknowns = list(dict.fromkeys(plan["unknowns"] + review["unknowns"]))
+        warnings = plan["unresolved"] + review["issues"] + oversize
+        result = {
+            "arranged": arranged,
+            "dots": dots,
+            "rewired": rewired,
+            "layout_review": {"issues": review["issues"], "unknowns": unknowns, "reviewed": review["reviewed"]},
+            "graph_changed": changed,
+        }
+        if plan["unresolved"]:
+            result["unresolved"] = plan["unresolved"]
+        if warnings:
+            result["warnings"] = warnings
+            result["note"] = (
+                "the arrangement was applied and read back; these warnings are what one pass could not resolve "
+                "(nothing was repeated, undone or moved outside the listed nodes)"
+            )
+        return result
+
+    # ---- node + intended purpose ----
+
+    @staticmethod
+    def _purpose_arg(args):
+        purpose = args.get("purpose")
+        if purpose is None:
+            return None
+        if not isinstance(purpose, str) or not purpose.strip():
+            raise ActionError(
+                "purpose must be a non-empty string naming the intended use of the node, e.g. 'grade:rgb' or "
+                "'ibkcolour:cleanplate'; nothing was changed"
+            )
+        return purpose.strip()
+
+    @staticmethod
+    def _treatments(actual_class, purpose, requested_class=None):
+        from ..knowledge import library as knowledge
+
+        found = knowledge.get_node_treatments(actual_class, purpose)
+        if found.get("status") == "unknown_node" and requested_class and requested_class != actual_class:
+            alias = knowledge.get_node_treatments(requested_class, purpose)
+            if alias.get("status") != "unknown_node":
+                return alias
+        return found
+
+    def _record_unresolved(self, name, cls, purpose):
+        """An explicit purpose with no documented treatment: replaces any earlier valid choice for this node."""
+        self.node_uses.append(
+            {"node": name, "class": cls, "purpose": purpose, "treatment_id": None, "review_channels": []}
+        )
+
+    def _node_use(self, node, purpose, requested_class=None, reuse=False):
+        """The documented treatment of this live node for its intended purpose, or None when there is nothing to say.
+
+        The class is the node's own. A purpose recorded earlier is reused (``reuse``) only for the same live
+        node name, the same actual class and the same treatment id; otherwise it is ignored. An undocumented
+        purpose is reported as such: the node action itself still succeeded. Knob values are read back now.
+        """
+        name, cls = node.fullName(), node.Class()
+        recorded = None
+        if purpose is None and reuse and self.stored_use is not None:
+            try:
+                stored = self.stored_use(name)
+            except Exception:
+                stored = None
+            if (
+                isinstance(stored, dict)
+                and stored.get("node_class") == cls
+                and stored.get("purpose")
+                and stored.get("treatment_id")
+            ):
+                recorded = stored
+        wanted = recorded["purpose"] if recorded else purpose
+        try:
+            found = self._treatments(cls, wanted, requested_class)
+            selected = found.get("selected")
+            if recorded and (not selected or selected.get("id") != recorded["treatment_id"]):
+                recorded, wanted = None, None
+                found = self._treatments(cls, None, requested_class)
+                selected = None
+        except Exception as exc:
+            if wanted is None:
+                return None
+            if purpose is not None:
+                self._record_unresolved(name, cls, purpose)
+            return {
+                "node": name,
+                "class": cls,
+                "purpose": wanted,
+                "status": "unavailable",
+                "reason": "the treatment lookup failed (%s: %s); the node action itself is unaffected" % (type(exc).__name__, exc),
+            }
+        status = found.get("status")
+        if wanted is None and status in ("unknown_node", "no_treatments", "ambiguous_node"):
+            return None
+        use = {"node": name, "class": cls, "purpose": wanted, "status": status, "available": found.get("available", [])}
+        if found.get("reason"):
+            use["reason"] = found["reason"]
+        if not selected:
+            if purpose is not None and recorded is None:
+                self._record_unresolved(name, cls, purpose)
+            return use
+        use["selected"] = {
+            key: selected.get(key) for key in ("purpose", "id", "title", "version", "truncated", "review_channels")
+        }
+        if recorded:
+            use["guidance_delivered"] = (
+                "treatment %s was delivered when this purpose was recorded for %s; pass purpose=%s to receive it again"
+                % (selected["id"], name, selected["purpose"])
+            )
+        else:
+            use["selected"]["guidance"] = selected.get("guidance")
+        controls, missing = {}, []
+        for control in (selected.get("control_names") or [])[:MAX_KNOBS]:
+            try:
+                knob = node.knob(control)
+                if knob is None:
+                    missing.append(control)
+                else:
+                    controls[control] = self._summary(knob, choices=True)
+            except Exception as exc:
+                controls[control] = {"value_error": "%s: %s" % (type(exc).__name__, exc)}
+        use["controls"] = controls
+        if missing:
+            use["controls_missing"] = missing
+        if not recorded:
+            self.node_uses.append(
+                {
+                    "node": name,
+                    "class": cls,
+                    "purpose": selected["purpose"],
+                    "treatment_id": selected["id"],
+                    "review_channels": list(selected.get("review_channels") or []),
+                }
+            )
+        return use
 
     # ---- project / sample ----
 
@@ -1372,7 +1806,7 @@ class NativeActions:
             for key in (
                 "evidence_id", "frame", "viewer", "viewer_input_node", "image_width", "image_height", "target",
                 "viewer_zoom_percent", "requested_viewer_center", "requested_region",
-                "viewer_source_format_width", "viewer_source_format_height", "viewer_image_matches_viewport",
+                "viewer_source_format_width", "viewer_source_format_height", "viewer_image_matches_viewport", "viewer_display",
             )
             if capture.get(key) is not None
         }
@@ -1758,5 +2192,10 @@ class NativeActions:
         if error is not None:
             result.update(success=False, error=error, traceback=trace, failure=failure)
         elif diff["node_errors"]:
-            result.update(success=False, error="a node reports an error after the code ran", node_errors=diff["node_errors"])
+            result["node_errors"] = diff["node_errors"]
+            result["node_errors_note"] = (
+                "the code completed and its changes are recorded; these nodes report an error state "
+                "(for example a missing input or channel) that affects their image: "
+                + ", ".join(entry["node"] for entry in diff["node_errors"])
+            )
         return result

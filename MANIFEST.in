@@ -1,5 +1,5 @@
 include LICENSE README.md THIRD_PARTY_NOTICES.md install.py pyproject.toml
-include docs/INSTALLATION.md docs/USAGE.md
+include docs/INSTALLATION.md docs/USAGE.md docs/RESEARCH-pi-extensions.md
 graft licenses
 recursive-include runtime/pi *.json *.mjs *.ts *.md
 graft runtime/pi/upstream-licenses

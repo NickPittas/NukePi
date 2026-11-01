@@ -37,6 +37,7 @@ Before building, organizing or keying a Nuke graph (even with familiar nodes), l
 - Scaling, rotating, stacked transforms, sharpness: `fundamentals/filtering-concatenation`.
 - Retiming, offsets, motion blur, frame ranges: `fundamentals/time-sampling`.
 - Choosing between nodes, or replacing one with an expression: `fundamentals/node-selection`.
+- One node for a stated purpose (IBKColour clean plate, IBKGizmo matte, Keylight single/core/edge key or despill output, Primatte, ChromaKeyer, Grade RGB or alpha, Saturation, spill map): `get_node_treatments(node_class, purpose)` returns that purpose's controls, view, good and failed results and when to ask, or states it is unsupported. Pages are `topics/use-*`. Unsupported purpose: ask the user; do not guess.
 
 ## Route deliberate operations
 Ordinary nodes compute when viewed or rendered; their normal knob edits do not need a special recipe. Fetch `section="workflow"` for the relevant family below before advanced Python. These are static, source-backed recipes; inspect the live generation and verify the resulting keys, values or files.

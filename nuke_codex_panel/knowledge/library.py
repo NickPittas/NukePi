@@ -56,6 +56,11 @@ REQUIRED_SECTIONS = {
     "node": ("purpose", "inputs", "controls", "verify", "pitfalls", "sources"),
 }
 KIND_DIRECTORIES = {"fundamental": "fundamentals", "topic": "topics", "node": "nodes"}
+PURPOSE_TAG_PREFIX = "purpose:"
+CONTROL_TAG_PREFIX = "control:"
+REVIEW_TAG_PREFIX = "review:"
+REVIEW_CHANNELS = ("rgb", "alpha")
+_PURPOSE_TAG = re.compile(r"^purpose:([a-z0-9]+):([a-z0-9]+(?:-[a-z0-9]+)*)$")
 
 _STOPWORDS = frozenset(
     "a an and are as at be by do does for from how i in is it of on or the to use using "
@@ -320,6 +325,7 @@ class KnowledgeBase:
                 names = [document.id.split("/", 1)[1], document.title, *document.aliases]
                 for name in names:
                     self._node_keys.setdefault(_normalize_key(name), set()).add(document.id)
+        self._treatments = self._build_treatments()
 
     def _validate_references(self) -> None:
         for document in self.documents.values():
@@ -424,6 +430,114 @@ class KnowledgeBase:
         document = self._resolve_node(node)
         result = self._render(document, section)
         result["runtime_verified"] = False
+        return result
+
+    def _build_treatments(self) -> dict[str, dict[str, str]]:
+        """node document id -> {purpose id -> topic id}, from ``purpose:<node>:<purpose>`` tags."""
+        treatments: dict[str, dict[str, str]] = {}
+        for document in self.documents.values():
+            for tag in document.tags:
+                if tag.startswith(REVIEW_TAG_PREFIX) and tag[len(REVIEW_TAG_PREFIX) :] not in REVIEW_CHANNELS:
+                    raise CorpusError("%s: tag %r must be review:rgb or review:alpha" % (document.id, tag))
+                if not tag.startswith(PURPOSE_TAG_PREFIX):
+                    continue
+                match = _PURPOSE_TAG.match(tag)
+                if document.kind != "topic" or not match:
+                    raise CorpusError(
+                        "%s: tag %r must be 'purpose:<node>:<purpose>' on a topic document" % (document.id, tag)
+                    )
+                node_id = "nodes/" + match.group(1)
+                node = self.documents.get(node_id)
+                if node is None or node.kind != "node":
+                    raise CorpusError("%s: tag %r names unknown node document %r" % (document.id, tag, node_id))
+                slot = treatments.setdefault(node_id, {})
+                if match.group(2) in slot:
+                    raise CorpusError("%s: duplicate purpose %r for %s" % (document.id, match.group(2), node_id))
+                slot[match.group(2)] = document.id
+        return treatments
+
+    def get_node_treatments(self, node_class, purpose=None) -> dict:
+        """Purpose-specific treatment of one node: which uses are documented, and the chosen one.
+
+        The node resolves through the node-reference aliases (so an OFX or versioned class name works
+        when listed there). ``purpose`` must equal a documented purpose id exactly; nothing is guessed.
+        ``status`` is one of selected, purpose_required, unsupported_purpose, no_treatments,
+        unknown_node, ambiguous_node.
+        """
+        if not isinstance(node_class, str) or not node_class.strip():
+            raise KnowledgeError("node_class must be a non-empty string")
+        name = node_class.strip()
+        if len(name) > 100 or "\x00" in name or "\\" in name or ".." in name or name.startswith("/"):
+            raise KnowledgeError("invalid node_class %r" % name[:100])
+        if purpose is not None and (not isinstance(purpose, str) or not purpose.strip()):
+            raise KnowledgeError("purpose must be a non-empty string when given")
+        result = {
+            "node_class": name,
+            "node_reference": None,
+            "available": [],
+            "selected": None,
+            "status": "unknown_node",
+            "reason": "no node reference matches %r; no purpose-specific guidance exists for it" % name,
+            "runtime_verified": False,
+        }
+        if name.lower().startswith("nodes/"):
+            document = self.documents.get(name)
+            ids = {document.id} if document is not None and document.kind == "node" else set()
+        else:
+            key = _normalize_key(name)
+            ids = self._node_keys.get(key) or (self._node_keys.get(key[: -len("node")]) if key.endswith("node") else None) or set()
+        if len(ids) > 1:
+            result["status"] = "ambiguous_node"
+            result["reason"] = "node_class %r is ambiguous between %s; pass an explicit nodes/<name> id" % (
+                name, ", ".join(sorted(ids)),
+            )
+            return result
+        if not ids:
+            return result
+        node_id = next(iter(ids))
+        result["node_reference"] = node_id
+        slot = self._treatments.get(node_id, {})
+        result["available"] = [
+            {"purpose": pid, "id": topic_id, "summary": self.documents[topic_id].summary}
+            for pid, topic_id in sorted(slot.items())
+        ]
+        if not slot:
+            result["status"] = "no_treatments"
+            result["reason"] = "%s has no purpose-specific guidance; use get_node_reference for its static reference" % node_id
+            return result
+        if purpose is None:
+            result["status"] = "purpose_required"
+            result["reason"] = "state the intended use of this node; documented purposes: %s" % ", ".join(slot)
+            return result
+        wanted = purpose.strip().lower()
+        wanted = wanted.removeprefix(node_id[len("nodes/") :] + ":")
+        topic_id = slot.get(wanted)
+        if topic_id is None:
+            result["status"] = "unsupported_purpose"
+            result["reason"] = "%r is not a documented purpose for %s (documented: %s); no guidance is guessed for it" % (
+                purpose.strip(), node_id, ", ".join(slot),
+            )
+            return result
+        rendered = self._render(self.documents[topic_id], "full")
+        result["selected"] = {
+            "purpose": wanted,
+            "id": topic_id,
+            "title": rendered["title"],
+            "guidance": rendered["content"],
+            "control_names": [
+                t[len(CONTROL_TAG_PREFIX) :] for t in self.documents[topic_id].tags if t.startswith(CONTROL_TAG_PREFIX)
+            ],
+            "review_channels": [
+                t[len(REVIEW_TAG_PREFIX) :] for t in self.documents[topic_id].tags if t.startswith(REVIEW_TAG_PREFIX)
+            ],
+            "truncated": rendered["truncated"],
+            "requires": rendered["requires"],
+            "related": rendered["related"],
+            "version": rendered["version"],
+            "sources": rendered["sources"],
+        }
+        result["status"] = "selected"
+        result["reason"] = None
         return result
 
     def _lookup_id(self, value) -> Document:
@@ -552,3 +666,7 @@ def get_compositing_guidance(topic_id, section="overview") -> dict:
 
 def get_node_reference(node, section="overview") -> dict:
     return default_knowledge().get_node_reference(node, section)
+
+
+def get_node_treatments(node_class, purpose=None) -> dict:
+    return default_knowledge().get_node_treatments(node_class, purpose)

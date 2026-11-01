@@ -1,21 +1,13 @@
-"""Per-client inspection checkpoint kept by the application-owned bridge.
+"""Graph revision and delivery accounting kept by the application-owned bridge.
 
-A workflow guard, not a sandbox: Python stays unrestricted. Every model client
-must have *received* current graph state before it may execute Python:
+Not a gate and not a sandbox: Python stays unrestricted and nothing is owed before it runs.
+The revision is a global counter that advances whenever the root-anchored graph fingerprint
+differs from the last one the bridge recorded (edits by Python, by the user, or by anything
+else) and whenever the fingerprint cannot be taken. Each observation also names which nodes
+differ, so results can report outside edits and unknown changes truthfully.
 
-* a ``get_nuke_context(include_nodes=true)`` result, and
-* a complete, all-scope root nodegraph screenshot,
-
-both at the current graph revision. The revision is a global counter that
-advances whenever the root-anchored graph fingerprint differs from the last one
-the bridge recorded (edits by Python, by the user, or by anything else) and
-whenever the fingerprint cannot be taken. Evidence only ever matches the
-revision it was recorded at, so it cannot unlock a different graph state, a
-different client, or a delivery that failed.
-
-Evidence is recorded at delivery confirmation, not at capture: the MCP sidecar
-confirms a ``delivery_token`` only after it has read the result (and image) it is
-about to hand to the model. An unconfirmed token never unlocks anything.
+A delivery token is provisional: the MCP sidecar confirms it only after it has read the result
+(and image) it is about to hand to the model. An unconfirmed token never counts as delivered.
 """
 
 from __future__ import annotations
@@ -25,15 +17,6 @@ from dataclasses import dataclass
 import secrets
 
 LEGACY_CLIENT = "legacy"
-
-CONTEXT = "context"
-SCREENSHOT = "screenshot"
-
-# Exact calls named to the model while a kind of evidence is missing.
-REQUIRED_CALLS = {
-    CONTEXT: "get_nuke_context(include_nodes=true)",
-    SCREENSHOT: "capture_nuke_screenshot(target='nodegraph', scope='all')",
-}
 
 _MAX_PENDING_DELIVERIES = 256
 _MAX_CLIENT_ID = 64
@@ -66,7 +49,6 @@ class InspectionGate:
         # None = baseline unknown; the next fingerprint is adopted as is, because the
         # revision already advanced when the baseline became unknown (or this is the first look).
         self._fingerprint = None
-        self._evidence: dict[str, dict[str, int]] = {}
         self._deliveries: OrderedDict[str, tuple[str, str, int]] = OrderedDict()
 
     def observe(self) -> Observation:
@@ -86,19 +68,10 @@ class InspectionGate:
         return Observation(self.revision, snapshot, True, changed)
 
     def graph_may_have_changed(self) -> int:
-        """Code ran and the graph is changed or unknown afterwards: invalidate all evidence."""
+        """Code ran and the graph is changed or unknown afterwards: advance the revision, drop the baseline."""
         self.revision += 1
         self._fingerprint = None
         return self.revision
-
-    def missing(self, client_id: str, revision: int, assume=()) -> list[str]:
-        """Calls this client still owes at ``revision``; ``assume`` kinds count as satisfied."""
-        held = self._evidence.get(client_id, {})
-        return [
-            REQUIRED_CALLS[kind]
-            for kind in (CONTEXT, SCREENSHOT)
-            if kind not in assume and held.get(kind) != revision
-        ]
 
     def issue_delivery(self, client_id: str, kind: str, revision: int) -> str:
         """Provisional evidence; it counts only once ``confirm_delivery`` is called with the token."""
@@ -109,7 +82,7 @@ class InspectionGate:
         return token
 
     def confirm_delivery(self, client_id: str, token: str) -> str:
-        """Record the evidence behind ``token`` for the client that was issued it.
+        """Count the delivery behind ``token`` for the client that was issued it; return its kind.
 
         Raises KeyError for an unknown, repeated, evicted, or other client's token.
         """
@@ -117,12 +90,9 @@ class InspectionGate:
         if entry is None or entry[0] != client_id:
             raise KeyError(token)
         del self._deliveries[token]
-        _, kind, revision = entry
-        self._evidence.setdefault(client_id, {})[kind] = revision
-        return kind
+        return entry[1]
 
     def forget(self, client_id: str) -> None:
-        """Drop this client's evidence and undelivered tokens (its session ended)."""
-        self._evidence.pop(client_id, None)
+        """Drop this client's undelivered tokens (its session ended)."""
         for token in [key for key, entry in self._deliveries.items() if entry[0] == client_id]:
             del self._deliveries[token]

@@ -8,7 +8,9 @@
 //    probeBridge) so the entry reports live bridge/lease state, not just that a file exists.
 // 2. `tool_call` surface guard: a call to a tool outside this session's launch allowlist is blocked
 //    with an explicit reason. Ordinary and nested (codemode `parentToolCallId`) calls are treated
-//    identically. Input is never mutated and nothing is executed on the extension's behalf.
+//    identically, except that `ask_user` (the pinned pi-ask-user question tool) is blocked when nested or
+//    when it passes a `timeout`: a question waits for the person, never a clock. Input is never mutated
+//    and nothing is executed on the extension's behalf.
 // 3. Nuke MCP result delivery: results keep their content/details/structuredContent/isError. The
 //    extension only (a) restores the full error text the MCP adapter shortened, from the complete
 //    CallToolResult it keeps in `structuredContent`, and (b) for a script (codemode) parent, appends
@@ -135,8 +137,11 @@ function readPackageVersion(dir: string | undefined): { version?: string; packag
 // ---- structural tool-surface guard ---------------------------------------------------------------
 
 // Used only when the launcher passed no `--tools`; mirrors harnesses/pi_rpc.py `_PI_TOOLS`.
-const DEFAULT_TOOL_PATTERNS = ["codemode", "tool_search", "mcp__nuke__*"];
+const ASK_USER_TOOL = "ask_user";
+const DEFAULT_TOOL_PATTERNS = ["codemode", "tool_search", "mcp__nuke__*", ASK_USER_TOOL];
 const NUKE_TOOL_PREFIX = "mcp__nuke__";
+// Marks a bridge result block that tells the model a runtime rule now applies (see bridge/question_gate.py).
+const RUNTIME_NOTICE_PREFIX = "[ask_before_further_changes]";
 
 function argvListValues(argv: readonly string[], flag: string): string[] {
 	const out: string[] = [];
@@ -252,6 +257,8 @@ interface ParentState {
 	images: Map<string, ImageBlock>;
 	// Failures of this extension's own handlers while recording for this parent.
 	internalFailures: string[];
+	// Bridge runtime notices (text blocks starting with RUNTIME_NOTICE_PREFIX) of this parent's nested calls.
+	notices: string[];
 }
 interface ResultView {
 	content: readonly unknown[];
@@ -554,7 +561,7 @@ export default function nukeRuntime(pi: ExtensionAPI): void {
 	const stateFor = (root: string): ParentState => {
 		let state = parents.get(root);
 		if (state === undefined) {
-			state = { nukeCalls: 0, evidence: [], blocked: [], pending: new Map(), aborted: new Map(), images: new Map(), internalFailures: [] };
+			state = { nukeCalls: 0, evidence: [], blocked: [], pending: new Map(), aborted: new Map(), images: new Map(), internalFailures: [], notices: [] };
 			parents.set(root, state);
 		}
 		return state;
@@ -589,6 +596,9 @@ export default function nukeRuntime(pi: ExtensionAPI): void {
 		}
 		for (const [hash, image] of resultImages(view)) {
 			if (!state.images.has(hash)) state.images.set(hash, image);
+		}
+		for (const block of structuredBlocks(view.structuredContent) ?? view.content) {
+			if (isText(block) && block.text.startsWith(RUNTIME_NOTICE_PREFIX) && !state.notices.includes(block.text)) state.notices.push(block.text);
 		}
 	};
 
@@ -626,6 +636,8 @@ export default function nukeRuntime(pi: ExtensionAPI): void {
 		for (const message of state.internalFailures) {
 			lines.push(`- The runtime extension failed while recording nested Nuke results for this script (${message}); some evidence may be missing.`);
 		}
+		// A Nuke runtime rule announced by a nested call's result that the script did not print (ask-before-further-changes).
+		for (const notice of state.notices) if (!parentText.includes(notice)) lines.push(`- ${notice}`);
 		// Only this parent's own images: never suppressed because an earlier call carried the same capture.
 		const attach: ImageBlock[] = [];
 		for (const [hash, image] of state.images) if (!shown.has(hash)) attach.push(image);
@@ -661,6 +673,13 @@ export default function nukeRuntime(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", (event) => {
 		const parentId = event.parentToolCallId;
+		// The owned question tool waits for the person, never a clock: it is model-only and takes no timeout.
+		if (event.toolName === ASK_USER_TOOL && (parentId !== undefined || (asRecord(event.input) ?? {}).timeout != null)) {
+			const why = parentId !== undefined ? "cannot be called from a script" : "does not accept a timeout (it waits until the person answers or cancels)";
+			stats.blockedCalls++;
+			stats.lastBlockedTool = event.toolName;
+			return { block: true, reason: `Blocked by the Nuke runtime extension: ${ASK_USER_TOOL} ${why}. Nothing was asked.` };
+		}
 		const reason = surfaceViolation(surface, event.toolName, parentId);
 		if (reason === undefined) {
 			if (parentId === undefined) live.add(event.toolCallId);

@@ -582,7 +582,11 @@ class ChatView(QtWidgets.QScrollArea):
 
     def _tool_finish(self, section: _ToolSection, info: dict):
         rec = section.rec
-        rec["status"] = "ok" if info.get("ok", True) else "error"
+        if info.get("outcome") == "interrupted":
+            # Stopped by the person (e.g. a cancelled question): the existing interrupted state, not "done".
+            rec["status"] = "interrupted"
+        else:
+            rec["status"] = "ok" if info.get("ok", True) else "error"
         if info.get("detail"):
             rec["result_summary"] = str(info["detail"])
         if "result" in info:

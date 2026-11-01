@@ -23,6 +23,8 @@ replaced by that agent's catalog, an empty one included, once a model query has 
 from __future__ import annotations
 
 import os
+import itertools
+import re
 import json
 import tempfile
 from pathlib import Path
@@ -59,22 +61,63 @@ PI_NATIVE_MCP_GUIDANCE = (
     "\n\nNuke tools (namespace mcp__nuke) are declared to you directly and stay available for "
     "the whole session, including after steering; call them by name, or from codemode via "
     "tools.mcp__nuke__<name>(). Use describeTool() in codemode if you need an input schema. "
-    "Only codemode, tool_search and mcp__nuke tools exist (no host read tool); the runtime "
-    "extension delivers full failure payloads, caught API errors and images to you. Await each "
-    "dependent Nuke mutation, then read fresh graph/context/image state before the next one; "
-    "never use Promise.all for dependent mutations. When a script relies on documentation or "
-    "API evidence, print it. For large output, filter or use the codemode structured result "
+    "Only codemode, tool_search, ask_user and mcp__nuke tools exist (no host read tool). ask_user asks "
+    "the person and waits for the answer; use it only for a decision or expertise you truly lack, "
+    "never as a routine check-in or to say you are done (the one required use is the runtime's "
+    "ask-before-further-changes question once a complete composite has been delivered); the runtime "
+    "extension delivers full failure payloads, caught API errors and images to you. A planned "
+    "multi-node structure is built whole and editable in one codemode execution: await each "
+    "mcp__nuke__nuke_action call in order (or one approved execute_python), no trust grant "
+    "needed for bounded calls. Use each returned observed state or failure before the dependent "
+    "step in the same script; never ignore a failed or partial result or repeat an unchanged "
+    "call, and keep every intent. Refresh context when uncertain, after user intervention and "
+    "after the structural batch; view images for visual decisions, including normal knob "
+    "tuning, not after every node. Await dependent mutations in order, never Promise.all. When a "
+    "script relies on documentation or API evidence, print it. For large output, filter or use "
+    "the codemode structured result "
     "instead of trying to read a file."
 )
 
 
 # Pi's own built-in code tools stay off: the model reaches Nuke only through codemode / MCP.
 _PI_EXCLUDED_TOOLS = "read,bash,edit,write,grep,find,ls,powershell"
-_PI_TOOLS = "codemode,tool_search,mcp__nuke__*"
+_ASK_USER_TOOL = "ask_user"
+_PI_TOOLS = "codemode,tool_search,mcp__nuke__*," + _ASK_USER_TOOL
 # How long a fresh agent may take to declare every Nuke tool before the panel reports an error.
 _TOOLS_READY_SECONDS = 60.0
 # Prefix of the owned /nuke_tools command's compact notify reply (must match runtime/pi/nuke-runtime.ts).
 _TOOLS_REPLY_PREFIX = "nuke-tool-readiness:"
+
+# pinned pi-ask-user 0.17.1 (index.ts askViaDialogs/formatOptionsForMessage): with allowMultiple the RPC
+# fallback is ONE input whose title ends with this marker and a "N. title — description" list, answered by
+# comma-separated titles (the numbers are not mapped back).
+_MULTI_MARKER = "\n\nOptions (select one or more):\n"
+_MULTI_PLACEHOLDER = "Type your selection(s)..."
+_OPTION_LINE = re.compile(r"^(\d+)\. (.*)$")
+
+
+def _parse_multi_select(title: str, placeholder: str):
+    """``(question text, [{"title", "description"}])`` for that dialog, else None (typed fallback)."""
+    if placeholder != _MULTI_PLACEHOLDER:
+        return None
+    head, marker, listing = title.rpartition(_MULTI_MARKER)
+    if not marker:
+        return None
+    choices: list[dict] = []
+    for line in listing.split("\n"):
+        match = _OPTION_LINE.match(line)
+        if match and int(match.group(1)) == len(choices) + 1:
+            name, separator, description = match.group(2).partition(" — ")
+            choices.append({"title": name, "description": description if separator else ""})
+        elif choices:
+            previous = choices[-1]
+            previous["description"] = (previous["description"] + "\n" + line) if previous["description"] else line
+        else:
+            return None
+    # The extension splits the reply on commas and trims each part, so a title must survive that.
+    if not choices or any(not c["title"] or "," in c["title"] or c["title"] != c["title"].strip() for c in choices):
+        return None
+    return head, choices
 
 
 def managed_pi_dir() -> Path:
@@ -181,6 +224,10 @@ class PiRpcClient(JsonlProcessClient):
     selected_model_changed = QtCore.Signal(str)
     # Managed Pi only: the model catalog or the private shortlist/default changed.
     model_preferences_changed = QtCore.Signal()
+    # Managed Pi only: the one answerable ask_user dialog (``{"active": False}`` when none).
+    question_changed = QtCore.Signal(dict)
+    # Managed Pi only: a run ended normally (not cancelled, steered, retried, failed or mid-question).
+    normal_end = QtCore.Signal()
 
     def __init__(self, cwd: str, parent=None, bridge_path: str | None = None):
         super().__init__(cwd, parent, bridge_path)
@@ -273,6 +320,18 @@ class PiRpcClient(JsonlProcessClient):
         # turn, so the panel must not offer "Steer" for it.
         self._fresh_pending = False
         self._tools_probe: dict | None = None
+        # ask_user: ONE managed bridge hold spans the whole tool call (every dialog stage of it), at most
+        # one dialog is answerable at a time, and the hold lifts when the tool ends. See `_ask_*`.
+        self._ask: dict | None = None
+        self._ask_dialog: dict | None = None
+        self._ask_published: dict = {"active": False}
+        self._ask_orphans: list[str] = []
+        # A lift of a finished ask_user hold that the bridge refused while an operation still ran:
+        # {"epoch", "control_id", "generation"} of THAT hold, so only it can ever be lifted later.
+        self._ask_release_pending: dict | None = None
+        self._ask_tokens = itertools.count(1)
+        self._turn_failed = False
+        self._ask_entry: Path | None = None
         self._lease = ControlLease(self.control_id, lambda: self._control_provider())
         self._steering = SteeringController(_PiBackend(self), self._lease, self._publish_intervention)
         self._intervention_state = self._decorated(self._steering.snapshot())
@@ -333,7 +392,11 @@ class PiRpcClient(JsonlProcessClient):
         # Nothing is discovered from global/project locations; only these extensions load.
         args.extend(["--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-themes"])
         args.extend(["--no-approve"])
-        for extension in ("builtin:mcp", "builtin:codemode", "builtin:tool-search", str(pi_runtime.DIAGNOSTICS_PATH)):
+        extensions = ["builtin:mcp", "builtin:codemode", "builtin:tool-search", str(pi_runtime.DIAGNOSTICS_PATH)]
+        if self._ask_entry is not None:
+            # The pinned pi-ask-user entry, loaded explicitly: no package/skill discovery.
+            extensions.append(str(self._ask_entry))
+        for extension in extensions:
             args.extend(["-e", extension])
         args.extend(["--tools", _PI_TOOLS, "--exclude-tools", _PI_EXCLUDED_TOOLS])
         return args
@@ -421,7 +484,7 @@ class PiRpcClient(JsonlProcessClient):
 
     def _publish_intervention(self, snapshot: dict):
         self._intervention_state = self._decorated(snapshot)
-        if self._steering.active:
+        if self._steering.active or self._ask_needs_timer():
             if not self._recheck_timer.isActive():
                 self._recheck_timer.start()
         else:
@@ -448,6 +511,7 @@ class PiRpcClient(JsonlProcessClient):
         if not self._lease.attach(self._control_event.emit):
             return
         self._control_opened = True
+        self._lease.enable_question_gate()
         try:
             self._announce_epoch(self.process_epoch)
         except Exception as exc:
@@ -494,6 +558,7 @@ class PiRpcClient(JsonlProcessClient):
         if self._reopen_pending and name == "operation_finished":
             self._reopen_control()
         self._retry_renewal_reopen()
+        self._ask_advance()
         self._steering.on_control_event(event)
         self._emit_activity()
 
@@ -566,6 +631,8 @@ class PiRpcClient(JsonlProcessClient):
         self._gate_report = None
         self._renewal_report = None
         self._interrupted_run = False
+        self._turn_failed = False
+        self._ask_forget()
         if not keep_mute:
             self._ui_muted = False
         self._content_index = -1
@@ -590,6 +657,7 @@ class PiRpcClient(JsonlProcessClient):
         """Resolve and configure what this process needs. Fails closed on any error."""
         try:
             self._runtime = pi_runtime.resolve_runtime()
+            self._ask_entry = pi_runtime.ask_user_extension()[0]
             # Validated here so a broken credential list fails closed with a clear message, not
             # later inside start() when the environment removals are computed.
             pi_runtime.credential_env_names()
@@ -716,6 +784,7 @@ class PiRpcClient(JsonlProcessClient):
             self._busy = True
             self._starting = False
             self._interrupted_run = False
+            self._turn_failed = False
             self._content_index = -1
             self._clear_activity_status()
             self._steering.on_run_started()
@@ -735,9 +804,19 @@ class PiRpcClient(JsonlProcessClient):
         elif kind == "turn_end":
             # A failed provider call still ends the turn; surface why instead
             # of leaving an empty reply on screen.
-            failed = (message.get("message") or {}).get("errorMessage")
-            if failed and not self._ui_muted:
-                self.error.emit("%s: %s" % (self.label, failed))
+            turn = message.get("message") or {}
+            failed = turn.get("errorMessage")
+            # Our own stop (Cancel/steer/new chat) aborts the provider call on purpose: that is a
+            # cancelled turn, not a provider failure. Every other error text stays a real error.
+            intentional = (
+                bool(failed)
+                and (turn.get("stopReason") == "aborted" or "aborted" in str(failed).lower())
+                and (self._interrupted_run or self._steering.active)
+            )
+            if failed and not intentional:
+                self._turn_failed = True
+                if not self._ui_muted:
+                    self.error.emit("%s: %s" % (self.label, failed))
         elif kind == "message_update":
             self._handle_stream_update(message.get("assistantMessageEvent") or {})
         elif kind == "tool_execution_start":
@@ -755,6 +834,7 @@ class PiRpcClient(JsonlProcessClient):
                     }
                 )
                 self._tool_started(message)
+                self._ask_tool_started(message)
         elif kind == "tool_execution_update":
             partial = message.get("partialResult")
             if not self._ui_muted:
@@ -770,20 +850,24 @@ class PiRpcClient(JsonlProcessClient):
                 )
         elif kind == "tool_execution_end":
             result = message.get("result")
+            # A question the person cancelled is an interrupted call, not a successful "done".
+            cancelled = self._ask_result_cancelled(message)
             if not self._ui_muted:
-                self.tool_event.emit(
-                    {
-                        "phase": "end",
-                        "id": message.get("toolCallId"),
-                        "tool": message.get("toolName", ""),
-                        "ok": not message.get("isError", False),
-                        "detail": compact_summary(_result_text(result)),
-                        "result": _present_result(result),
-                        "time_ns": time.monotonic_ns(),
-                    }
-                )
+                end_event = {
+                    "phase": "end",
+                    "id": message.get("toolCallId"),
+                    "tool": message.get("toolName", ""),
+                    "ok": not message.get("isError", False),
+                    "detail": compact_summary(_result_text(result)),
+                    "result": _present_result(result),
+                    "time_ns": time.monotonic_ns(),
+                }
+                if cancelled:
+                    end_event["outcome"] = "interrupted"
+                self.tool_event.emit(end_event)
             if not self._ui_muted:
                 self._tool_finished(message)
+            self._ask_tool_ended(message)
             # The tracker already dropped this tool: a waiting steering step may continue.
             self._steering.on_backend_progress()
         elif kind == "extension_ui_request":
@@ -799,13 +883,25 @@ class PiRpcClient(JsonlProcessClient):
 
     def _end_run(self, status: str):
         """The run is over: close its UI turn once and let waiting steering steps continue."""
+        # Not a normal end: a cancel/steer/new chat, a failed provider call, or a hold still owed.
+        normal = (
+            status == "completed"
+            and not self._ui_muted
+            and not self._turn_failed
+            and not self._steering.active
+            and self._renewal is None
+            and self._ask_dialog is None
+        )
         self._busy = False
         self._starting = False
         self._interrupted_run = False
         self._clear_activity_status()
         self._activity.close_run()
+        self._ask_clear(resume=True)
         if not self._ui_muted:
             self.turn_completed.emit(status)
+        if normal:
+            self.normal_end.emit()
         self._send({"type": "get_session_stats"}, self._stats_loaded)
         self._steering.on_run_ended()
         self._emit_activity(True)
@@ -870,9 +966,13 @@ class PiRpcClient(JsonlProcessClient):
         self._activity_status = None
 
     def _handle_extension_ui(self, message: dict):
-        # Dialog methods block until answered; decline them. Fire-and-forget
+        # Only the pinned ask_user tool's select/input stages become a real question, one at a time.
+        # Every other dialog method blocks until answered, so it is declined. Fire-and-forget
         # methods (notify/setStatus/setWidget/setTitle) are ignored.
-        if message.get("method") in ("select", "confirm", "input", "editor"):
+        method = message.get("method")
+        if method in ("select", "input") and self._ask_open_dialog(message):
+            return
+        if method in ("select", "confirm", "input", "editor"):
             self._write(
                 {
                     "type": "extension_ui_response",
@@ -880,6 +980,310 @@ class PiRpcClient(JsonlProcessClient):
                     "cancelled": True,
                 }
             )
+
+    # -- ask_user: a question that really waits ---------------------------------------------------
+    #
+    # One ask_user tool call may show several select/input stages (freeform follow-up, a batch).
+    # The bridge control is held (paused, NOT retired: the same process carries on afterwards) from
+    # the tool's start to its end, so no Nuke operation is admitted between stages. Operations that
+    # were already admitted finish first; the dialog is answerable only once they have. Requests
+    # refused during the hold are never queued or replayed. There is no timer: the person answers
+    # or cancels (Cancel is the ordinary run stop). Nothing here is a permission or a trust grant.
+
+    def _ask_needs_timer(self) -> bool:
+        ask = self._ask
+        return bool((ask is not None and ask["barrier"] == "set" and not ask["drained"]) or self._ask_release_pending)
+
+    def _ask_sync_timer(self):
+        # The shared recheck timer is only a safety net for a missed bridge event; it is not a deadline.
+        if self._steering.active or self._ask_needs_timer():
+            if not self._recheck_timer.isActive():
+                self._recheck_timer.start()
+        else:
+            self._recheck_timer.stop()
+
+    def question_state(self) -> dict:
+        return dict(self._ask_published)
+
+    def _ask_publish(self):
+        ask, dialog = self._ask, self._ask_dialog
+        if ask is None or dialog is None:
+            payload = {"active": False}
+        else:
+            payload = {
+                "active": True,
+                "token": dialog["token"],
+                "method": "multi" if dialog["multi"] is not None else dialog["method"],
+                "title": dialog["title"],
+                "options": list(dialog["options"]),
+                "choices": [dict(c) for c in dialog["multi"] or []],
+                "placeholder": dialog["placeholder"],
+                "answerable": bool(ask["drained"]),
+            }
+        if payload != self._ask_published:
+            self._ask_published = payload
+            if payload["active"] and payload["answerable"]:
+                self._set_activity_status("%s: waiting for your answer" % self.label)
+            self.question_changed.emit(dict(payload))
+        self._ask_sync_timer()
+
+    def _ask_tool_started(self, message: dict):
+        if message.get("toolName") != _ASK_USER_TOOL or self._ask is not None or self._steering.active:
+            return
+        # A finished call's refused lift is superseded: this call's own hold (the control is still
+        # paused, same generation) takes over and is lifted only by this call's end.
+        self._ask_release_pending = None
+        ask = {
+            "id": message.get("toolCallId"),
+            "epoch": self.process_epoch,
+            "barrier": "none",
+            "generation": None,
+            "drained": True,
+        }
+        if self._lease.available:
+            try:
+                status = self._lease.pause(retire=False)
+            except Exception as exc:
+                ask["barrier"] = "failed"
+                self.error.emit("%s: Nuke tools could not be held while asking you: %s" % (self.label, exc))
+            else:
+                ask["barrier"] = "set"
+                ask["generation"] = status.get("generation")
+                ask["drained"] = not status.get("operations")
+        self._ask = ask
+        self._ask_publish()
+
+    def _ask_check(self) -> str:
+        """``ok`` (hold intact, drained), ``draining`` (admitted operations still running) or ``lost``."""
+        ask = self._ask
+        if ask["barrier"] == "failed":
+            return "lost"
+        if ask["barrier"] != "set":
+            return "ok"
+        status = self._lease.status()
+        if not status.get("paused") or status.get("revoked") or status.get("generation") != ask["generation"]:
+            return "lost"
+        ask["drained"] = not status.get("operations")
+        return "ok" if ask["drained"] else "draining"
+
+    def _ask_advance(self):
+        """A bridge event or the recheck: continue a drain, or retry lifting a hold that was still busy."""
+        self._ask_retry_release()
+        if self._ask is None or self._steering.active:
+            return
+        if self._ask_check() == "lost":
+            self._ask_abandon("the Nuke tool hold was changed by something else")
+        else:
+            self._ask_publish()
+
+    def _ask_retry_release(self):
+        """Lift a finished call's hold the bridge refused earlier, but only that exact hold."""
+        pending = self._ask_release_pending
+        if pending is None:
+            return
+        if (
+            self._ask is not None
+            or self._steering.active
+            or self._renewal is not None
+            or pending["epoch"] != self.process_epoch
+            or pending["control_id"] != self.control_id
+        ):
+            self._ask_release_pending = None  # a newer question or the stop/renewal owns the control now
+        else:
+            status = self._lease.status()
+            if not status.get("paused") or status.get("revoked") or status.get("generation") != pending["generation"]:
+                self._ask_release_pending = None  # not the hold this lift was for
+            elif self._ask_resume():
+                self._ask_release_pending = None
+        self._ask_sync_timer()
+
+    @staticmethod
+    def _ask_result_cancelled(message: dict) -> bool:
+        if message.get("toolName") != _ASK_USER_TOOL:
+            return False
+        result = message.get("result")
+        details = result.get("details") if isinstance(result, dict) else None
+        return isinstance(details, dict) and details.get("cancelled") is True
+
+    @staticmethod
+    def _ask_answers(message: dict) -> list[str]:
+        """What the person actually chose or typed in a completed ask_user call (single or batch).
+
+        Read from the tool's own result (pi-ask-user ``details.response`` / ``details.answers[].response``):
+        selection titles and typed text only. A selection's comment and the dialog's navigation stages
+        (such as the custom-response sentinel) are not answers.
+        """
+        result = message.get("result")
+        details = result.get("details") if isinstance(result, dict) else None
+        if not isinstance(details, dict) or details.get("cancelled") is True:
+            return []
+        if isinstance(details.get("answers"), list):
+            responses = [item.get("response") for item in details["answers"] if isinstance(item, dict) and item.get("status") == "answered"]
+        else:
+            responses = [details.get("response")]
+        answers = []
+        for response in responses:
+            if not isinstance(response, dict):
+                continue
+            if response.get("kind") == "selection":
+                answers.extend(item for item in response.get("selections") or [] if isinstance(item, str))
+            elif response.get("kind") == "freeform" and isinstance(response.get("text"), str):
+                answers.append(response["text"])
+        return answers
+
+    def _ask_resume(self) -> bool:
+        """Lift the hold. False only while the bridge still counts an operation (retry later)."""
+        try:
+            return self._lease.resume() is not None
+        except Exception as exc:
+            self.error.emit("%s: Nuke tools could not be reopened after the question: %s" % (self.label, exc))
+            return True
+
+    def _ask_open_dialog(self, message: dict) -> bool:
+        """Take one select/input stage of the running ask_user call as the answerable dialog."""
+        ask = self._ask
+        request_id = message.get("id")
+        if (
+            ask is None
+            or ask["barrier"] == "failed"
+            or self._steering.active
+            or self._stopping
+            or self._renewal is not None
+            or ask["epoch"] != self.process_epoch
+            or not isinstance(request_id, str)
+            or not request_id
+        ):
+            return False
+        if self._ask_dialog is not None:
+            # One dialog at a time: a repeat of the pending one changes nothing; any other is declined.
+            return self._ask_dialog["id"] == request_id
+        method, title = message.get("method"), message.get("title")
+        options = message.get("options") if method == "select" else []
+        if not isinstance(title, str) or not isinstance(options, list) or not all(isinstance(o, str) for o in options):
+            return False
+        if method == "select" and not options:
+            return False
+        placeholder = message.get("placeholder")
+        multi = _parse_multi_select(title, placeholder) if method == "input" and isinstance(placeholder, str) else None
+        self._ask_dialog = {
+            "id": request_id,
+            "token": next(self._ask_tokens),
+            "method": method,
+            "title": multi[0] if multi is not None else title,
+            "multi": multi[1] if multi is not None else None,
+            "options": list(options),
+            "placeholder": placeholder if isinstance(placeholder, str) else "",
+            "epoch": self.process_epoch,
+            "control_id": self.control_id,
+            "session_id": self.session_id,
+        }
+        if self._ask_check() == "lost":
+            self._ask_abandon("the Nuke tool hold could not be kept while asking")
+        else:
+            self._ask_publish()
+        return True
+
+    def answer_question(self, token: int, value: str) -> bool:
+        """The person's answer to the open dialog. True when it was delivered to the agent."""
+        ask, dialog = self._ask, self._ask_dialog
+        if ask is None or dialog is None or dialog["token"] != token:
+            return False
+        if (
+            self._steering.active
+            or self._stopping
+            or self._renewal is not None
+            or ask["epoch"] != self.process_epoch
+            or dialog["epoch"] != self.process_epoch
+            or dialog["control_id"] != self.control_id
+            or (dialog["session_id"] and dialog["session_id"] != self.session_id)
+        ):
+            self._ask_invalidate()
+            return False
+        verdict = self._ask_check()
+        if verdict == "lost":
+            self._ask_abandon("the Nuke tool hold was changed by something else")
+            return False
+        if verdict == "draining":
+            self._ask_publish()
+            self.status_changed.emit("%s: waiting for a running Nuke operation to finish before your answer" % self.label)
+            return False
+        text = value.strip() if isinstance(value, str) else ""
+        if dialog["multi"] is not None:
+            titles = [c["title"] for c in dialog["multi"]]
+            picked = value.split(", ") if isinstance(value, str) else []
+            if not picked or any(item not in titles for item in picked):
+                return False
+            text = ", ".join(item for item in titles if item in picked)  # exact titles, listing order
+        elif dialog["method"] == "select":
+            if value not in dialog["options"]:
+                return False
+            text = value
+        elif not text and not dialog["placeholder"].lower().startswith("optional"):
+            return False
+        self._ask_dialog = None
+        self._write({"type": "extension_ui_response", "id": dialog["id"], "value": text})
+        self._ask_publish()
+        return True
+
+    def _ask_invalidate(self):
+        """Drop the open dialog so no late answer can reach it; the agent's pending request is cancelled
+        right after the abort that is about to stop the run (the abort signal settles it itself)."""
+        dialog, self._ask_dialog = self._ask_dialog, None
+        if dialog is not None and self.process.state() != QtCore.QProcess.ProcessState.NotRunning:
+            self._ask_orphans.append(dialog["id"])
+            if self._interrupted_run:
+                self._ask_flush_orphans()
+        self._ask_publish()
+
+    def _ask_flush_orphans(self):
+        orphans, self._ask_orphans = self._ask_orphans, []
+        for request_id in orphans:
+            self._write({"type": "extension_ui_response", "id": request_id, "cancelled": True})
+
+    def _ask_abandon(self, reason: str):
+        """The question cannot be kept safe: stop the run (ordinary Cancel) instead of letting it carry on."""
+        self.error.emit("%s: the question was stopped: %s" % (self.label, reason))
+        self._ask_invalidate()
+        if not self._steering.cancel():
+            self._ask_flush_orphans()
+            self._ask_clear(resume=True)
+
+    def _ask_tool_ended(self, message: dict):
+        ask = self._ask
+        if ask is None or message.get("toolName") != _ASK_USER_TOOL or ask["id"] != message.get("toolCallId"):
+            return
+        cancelled = self._ask_result_cancelled(message)
+        self._ask_dialog = None
+        # A cancelled question must really stop the run, not just close a dialog and let the model go on.
+        if cancelled and self._busy and not self._steering.active and not self._stopping and self._steering.cancel():
+            self._ask_forget()  # the stop owns the hold now and reopens it itself
+            return
+        if not cancelled and not self._steering.active and not self._stopping and ask["epoch"] == self.process_epoch:
+            # The completed result decides the ask-before-further-changes gate (a cancelled question is no
+            # answer and leaves it armed), before the hold is lifted so no Nuke request can race ahead of it.
+            self._lease.question_answered(self._ask_answers(message))
+        self._ask_clear(resume=True)
+
+    def _ask_clear(self, resume: bool):
+        """The ask_user call is over: forget it and lift the hold before any later Nuke request."""
+        ask = self._ask
+        self._ask, self._ask_dialog = None, None
+        self._ask_publish()
+        if ask is not None and resume and ask["barrier"] == "set" and not self._steering.active and self._renewal is None:
+            if not self._ask_resume():
+                self._ask_release_pending = {
+                    "epoch": ask["epoch"],
+                    "control_id": self.control_id,
+                    "generation": ask["generation"],
+                }
+        self._ask_sync_timer()
+
+    def _ask_forget(self):
+        """Process gone or stop/renewal in charge of the control: drop all question state, lift nothing."""
+        self._ask, self._ask_dialog = None, None
+        self._ask_orphans = []
+        self._ask_release_pending = None
+        self._ask_publish()
 
     def _query_state(self, models_loaded=None):
         self._send({"type": "get_available_models"}, models_loaded or self._models_loaded)
@@ -1161,6 +1565,7 @@ class PiRpcClient(JsonlProcessClient):
         ``restore`` back to the user. While un-acknowledged, no abort is issued for the run it
         would start (an abort before admission could miss it).
         """
+        self._lease.person_message()
         self._starting = True
         self._unacked += 1
         self._activity.note_starting()
@@ -1221,6 +1626,7 @@ class PiRpcClient(JsonlProcessClient):
         retried a few times if it raced the run's start); queues survive an abort in pi, so they
         are taken back before anything can resume.
         """
+        self._ask_invalidate()
         state = {"attempts": 0, "withdrawn": [], "restore": False}
 
         def finish(ok, error=None):
@@ -1234,6 +1640,7 @@ class PiRpcClient(JsonlProcessClient):
             self._activity.note_stopping(True)
             self._emit_activity(True)
             self._send({"type": command}, acknowledged, lambda text, _m: finish(False, text))
+            self._ask_flush_orphans()
 
         def acknowledged(message):
             data = message.get("data") or {}
@@ -1270,6 +1677,7 @@ class PiRpcClient(JsonlProcessClient):
         self._starting = False
         self._interrupted_run = False
         self._activity.close_run()
+        self._ask_forget()
         if was_busy and not self._ui_muted:
             self.turn_completed.emit("interrupted")
         self._emit_activity(True)
@@ -1416,6 +1824,11 @@ class PiRpcClient(JsonlProcessClient):
         if self._lease.available and self._lease.status().get("active_operations"):
             renewal["detail"]("waiting for a Nuke operation to finish before the new agent starts")
             return
+        if renewal["fresh"]:
+            # A new chat, old agent fenced and Nuke drained: the previous conversation's bridge state (workflow,
+            # authored-node scope, evidence, ask-before-further-changes gate) must not carry over. A
+            # same-conversation renewal keeps it.
+            self._lease.reset_conversation()
         try:
             status = self._lease.resume() if self._lease.available else {}
         except Exception as exc:
@@ -1432,6 +1845,7 @@ class PiRpcClient(JsonlProcessClient):
 
     def _on_recheck(self):
         self._steering.recheck()
+        self._ask_advance()
         self._retry_renewal_reopen()
 
     def _restore_selection(self):
@@ -2055,6 +2469,7 @@ class _PiBackend(SteeringBackend):
         return self.client.can_renew_session()
 
     def barrier_set(self, status: dict):
+        self.client._ask_invalidate()
         if status.get("active_operations"):
             self.client._reject_approval_dialogs()
 

@@ -25,17 +25,22 @@ ACTION_DESCRIPTION = (
     "Bounded native Nuke actions: one validated step per call, real classes, knobs, enum labels and "
     "input ports, state read back and reported. One action creates at most one node; configure that "
     "node in the same call. Use these instead of execute_python for ordinary work.\n"
-    "create {class, name?, knobs?, inputs?{port: node}, place?, select?} - a native class; Roto/RotoPaint "
+    "create {class, name?, knobs?, inputs?{port: node}, place?, select?, purpose?} - a native class; Roto/RotoPaint "
     "for every shape; the one existing Viewer is reused, never added. A failed configuration removes the "
-    "new node again (verified).\n"
+    "new node again (verified). purpose names what this node is FOR (e.g. grade:rgb, ibkcolour:cleanplate): when "
+    "documented, the result carries node_use with that purpose's guidance and the real readback of its controls; "
+    "an undocumented purpose is reported there and the node is still created.\n"
     "set {node, knobs{name: value}} - enum labels exactly as the knob lists them; arrays as lists; "
     "{\"expression\": ...} is free-form and needs user approval.\n"
-    "inspect {node?, knobs?[], match?, non_default?} - live knob values, enum choices, ports. match=text "
-    "finds knob names/labels; no node = scene header.\n"
+    "inspect {node?, knobs?[], match?, non_default?, purpose?} - live knob values, enum choices, ports. match=text "
+    "finds knob names/labels; no node = scene header. purpose on an existing node returns its node_use; a "
+    "purpose recorded for the same node and class is reused when omitted.\n"
     "connect {node, inputs{port: node|null}} - ports are input indexes (Merge: 0=B background, 1=A "
     "foreground; 'B'/'A' accepted). swap {node, a, b} swaps two inputs. select {nodes[]}. delete {node}.\n"
     "layout {placements[{node, below|above|left_of|right_of: node | x+y, gap?, dx?, dy?}]} top-to-bottom "
-    "B trunk, A branches to the side.\n"
+    "B trunk, A branches to the side; or {arrange: true, nodes[explicit names], output?} one arrangement pass "
+    "of exactly those nodes (sources above consumers, trunk column, side/mask lanes, Dot waypoints for edges that "
+    "would cross a node; other nodes are only anchors). Unresolved problems come back as warnings, not failure.\n"
     "project {width,height,pixel_aspect?,fps?,first_frame?,last_frame?,format_name?} - existing content "
     "needs allow_overwrite=true and a reason; same values change nothing.\n"
     "sample {node, x, y, frame?, size?[dx,dy], channels?} pixel measurements (never a visual verdict).\n"
@@ -114,6 +119,9 @@ ACTION_INPUT_SCHEMA = {
         "opacity": {"type": "number"},
         "feather": {"type": "number"},
         "code": {"type": "string"},
+        "purpose": {"type": "string", "description": "create/inspect: the node's intended use, e.g. grade:rgb or ibkcolour:cleanplate."},
+        "arrange": {"type": "boolean", "description": "layout: arrange the listed `nodes` instead of using placements."},
+        "output": {"type": "string", "description": "layout arrange: the terminal node that anchors the arrangement."},
         "label": {"type": "string"},
     },
 }
@@ -235,10 +243,11 @@ class GuidedNuke:
 
     # ---- actions ----
 
-    def action(self, client_id, arguments, revision, capture_callback, missing_inspection=None) -> dict:
+    def action(self, client_id, arguments, revision, capture_callback) -> dict:
         arguments = dict(arguments or {})
         name = arguments.get("action")
         runner = NativeActions(self.facts)
+        runner.stored_use = lambda node_name: self.engine.node_use(client_id, node_name)
 
         def record(capture):
             self.engine.record_capture(client_id, capture, capture.get("graph_revision", revision))
@@ -267,26 +276,43 @@ class GuidedNuke:
         result["touched_nodes"] = list(runner.touched)
         if result.get("graph_changed") is True and result.get("success") is False:
             result["partial"] = (
-                "the action changed the graph before it failed; nothing is assumed rolled back - inspect the "
-                "node(s) named in touched_nodes"
+                "the action changed the graph before it failed; nothing was rolled back or replayed. "
+                "`changes` and the readback in this result (applied, knobs, inputs, connected) are the state that "
+                "exists now; touched_nodes names the node(s) it was working on"
                 if not result.get("rolled_back")
                 else "the action's new node was removed again (verified)"
             )
         if isinstance(name, str):
             self.engine.note_action(client_id, name, arguments, result)
-        status = self.engine.status(client_id, missing_inspection)
+        for touched in runner.touched:
+            if not touched.startswith("<") and self.facts.node(touched) is None:
+                self.engine.record_node_use(client_id, touched, None, None, None)  # deleted or renamed: no stale purpose
+        if name == "create" and result.get("success") is not False and isinstance(result.get("node"), str):
+            # A freshly created final node name never inherits the purpose of an earlier node of the same name.
+            self.engine.record_node_use(client_id, result["node"], None, None, None)
+        if result.get("success") is not False:
+            for use in runner.node_uses:
+                self.engine.record_node_use(
+                    client_id, use["node"], use["class"], use["purpose"], use["treatment_id"], use["review_channels"]
+                )
+        self.engine.record_scope(
+            client_id,
+            [item for item in runner.touched if not item.startswith("<")],
+            source="python" if name == "internal_python" else "action",
+        )
+        status = self.engine.status(client_id)
         if status is not None:
             result["workflow"] = status
         return result
 
     # ---- workflows ----
 
-    def workflow(self, client_id, arguments, revision, missing_inspection=None) -> dict:
+    def workflow(self, client_id, arguments, revision) -> dict:
         try:
-            result = self.engine.request(client_id, dict(arguments or {}), missing_inspection)
+            result = self.engine.request(client_id, dict(arguments or {}))
         except WorkflowError as exc:
             result = {"success": False, "error": str(exc)}
-            status = self.engine.status(client_id, missing_inspection)
+            status = self.engine.status(client_id)
             _merge_recovery(result, _workflow_recovery(arguments or {}, status))
             if status is not None:
                 result["workflow"] = status
@@ -325,6 +351,12 @@ _WORKFLOW_FIELDS = {
     "abandon": ["reason"],
 }
 
+# Facts a failed action may already carry that name the live alternatives or the actual node state.
+_EXPLAINING_FACTS = (
+    "applied", "choices", "close", "matches", "input_slots", "channels", "viewers", "shapes", "use",
+    "connected", "inputs", "knobs", "copy",
+)
+
 
 def _action_recovery(name, arguments, result, runner, returned=False) -> dict | None:
     """Focused, read-only recovery facts for a failed ``nuke_action`` call.
@@ -357,14 +389,17 @@ def _action_recovery(name, arguments, result, runner, returned=False) -> dict | 
         node = runner.touched[0] if runner.touched else None
     nested = result.get("recovery") if isinstance(result.get("recovery"), dict) else {}
     missing = result.get("missing_node") or nested.get("missing_node")
-    # An inspection only helps when the node exists and the refusal did not already explain everything.
+    # An inspection helps only when the result left the node's state unexplained: a refusal that changed
+    # nothing, or one that already carries the live choices/candidates/readback, says what to do next.
+    explained = any(result.get(key) for key in _EXPLAINING_FACTS)
     if (
         node
         and not unsupported
         and node.strip() != missing
         and not result.get("rolled_back")
         and name != "delete"
-        and not (name == "create" and result.get("graph_changed") is False)
+        and result.get("graph_changed") is not False
+        and not explained
     ):
         recovery["next_calls"] = [{"tool": "nuke_action", "arguments": {"action": "inspect", "node": node.strip()}}]
     elif unsupported:

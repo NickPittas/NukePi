@@ -14,9 +14,13 @@ Ignored (reproducible from the above): `node/`, `node_modules/`.
 
 ## Managed MCP readiness
 
-The panel registers its Nuke MCP server with direct exposure. Its restricted tool list remains `codemode,tool_search,mcp__nuke__*`, with the ordinary coding tools excluded. Direct declaration avoids depending on replay of lazily discovered tools when Pi resumes with an explicit tool selection.
+The panel registers its Nuke MCP server with direct exposure. Its restricted tool list is `codemode,tool_search,mcp__nuke__*,ask_user`, with the ordinary coding tools excluded. Direct declaration avoids depending on replay of lazily discovered tools when Pi resumes with an explicit tool selection.
 
 The owned `/nuke_tools` command reports registered and active Nuke tool names without a provider turn. The panel checks this before reporting ready on initial launch and steering renewal. If the complete bundled Nuke toolset does not become active during the bounded startup wait, it stays not-ready and reports an error; it does not send the pending model prompt. `/nuke_runtime` remains the fuller diagnostic snapshot.
+
+## ask_user (question tool)
+
+The pinned third-party extension `pi-ask-user` 0.17.1 (MIT, https://github.com/edlsh/pi-ask-user, Pi package page https://pi.dev/packages/pi-ask-user) is installed from `package.json`/`package-lock.json` (pin and integrity also in `manifest.json` under `ask_user`) and loaded explicitly with `-e node_modules/pi-ask-user/index.ts`; the launch stays `--no-extensions --no-skills`, so its bundled skill is never discovered. It makes no network or model calls. Its npm peer `@sinclair/typebox` is installed only because npm requires it; Pi supplies its own `typebox`/`@sinclair/typebox` aliases at load time. In RPC mode the tool falls back to `select`/`input` dialogs, which the panel shows as a question card (one dialog at a time) and answers from the message box. The tool is `exposure: model-only`; `nuke-runtime.ts` additionally blocks an `ask_user` call that passes `timeout` or is nested, because a question waits for the person and never for a clock. Cancel stops the run through the ordinary Cancel path. While one `ask_user` call runs the panel holds (pauses, without retiring) the bridge control for the whole tool call and lifts it when the tool ends.
 
 ## Install
 

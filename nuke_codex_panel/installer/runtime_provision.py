@@ -269,6 +269,11 @@ def verify_sources(runtime_dir: Path, manifest: dict) -> None:
     if locked.get("version") != pi_spec["version"] or locked.get("integrity") != pi_spec["tarball_integrity"]:
         raise InstallError("package-lock.json does not pin {} {} with the manifest integrity".format(
             pi_spec["package"], pi_spec["version"]))
+    ask_spec = manifest["ask_user"]
+    ask_locked = lock.get("packages", {}).get("node_modules/" + ask_spec["package"], {})
+    if ask_locked.get("version") != ask_spec["version"] or ask_locked.get("integrity") != ask_spec["tarball_integrity"]:
+        raise InstallError("package-lock.json does not pin {} {} with the manifest integrity".format(
+            ask_spec["package"], ask_spec["version"]))
     for name in ("nuke-runtime.ts", "auth-helper.mjs"):
         if not (runtime_dir / name).is_file():
             raise InstallError("owned runtime file missing: {}".format(runtime_dir / name))

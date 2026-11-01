@@ -15,20 +15,40 @@ source_ids: ["foundry-17.1", "studio-conventions"]
 # IBKGizmo
 
 ## Purpose
-Source-documented: uses an input clean plate to drive the key, often helpful on uneven screens. The IBK pair is IBKColor plus IBKGizmo. The output is premultiplied with an alpha and does not composite over the background.
+Source-documented: IBKGizmo keys using a clean-screen reference, helpful on uneven screens, and its output is premultiplied with alpha (not a finished comp). Menu entry "IBKGizmo" creates script class `IBKGizmoV3` (gizmo `IBKGizmoV3.gizmo`, two internal IBK ops plus a Switch). Studio policy: use it mainly for detailed edge alpha.
 
 ## Inputs
-bg (background used for fine edge detail), c (IBKColor output or a location clean plate), and fg (the screen image).
+- `fg` (input 0): the screen plate.
+- `c` (input 1): IBKColour output or a location clean plate. Keep it connected in reference-based mode; not needed when screen type is pick.
+- `bg` (input 2): optional replacement background used for fine edge detail. Studio policy: leave it unconnected.
 
 ## Controls
-Documented knobs: screen type -> `st` (default C-blue); color; red_weight (default 0.5); blue_green_weight (default 0.5); more controls exist on the page. Script class aliases in frontmatter are common names, not guaranteed UI names; verify with node.Class().
+Source-verified; defaults are starting points, not blind changes.
+- `st` (screen type): C-blue (default), C-green, pick. `colour` (default 0,0,1) is used only with pick.
+- `red_weight`, `blue_green_weight` (default 0.5 each): matte hardness in red / blue-green areas. Lower a weight when the edge looks discoloured because the matte is too strong. If one weight fixes one edge but breaks another, split several IBKGizmos with Keymix (docs).
+- `lm_enable` (luminance match), `level` (screen range, default 1), `luma` (luminance level, default 0), `ll_enable` (UI label "enable", default disabled): luminance match captures transparent foreground brighter than the screen. Lowering screen range reduces screen-area noise but too far eats foreground blacks. `ll_enable` activates the luminance level control: `luma` adjustments have no effect until `ll_enable` is checked. Docs: luma is usually effective only in a small number of cases and generally needs no adjustment, so enable it only if the shot calls for it. Change one at a time and compare.
+- `autolevels` with `yellow`, `cyan`, `magenta` keep boxes: pre-key correction for hard edges on saturated foreground. Best as a separate node; weights then behave unexpectedly.
+- `ss` (screen subtraction): removes backing from the RGB; off premultiplies the original fg by the matte.
+- `ublu`, `ubcr` (use bkg luminance / chroma): bg-driven edge brightness/colour on the RGB output; they require bg. They act on RGB, not the studio alpha-only path.
+Leave unspecified controls at defaults. There are no RGB despill controls here.
+
+## Workflow
+Studio policy:
+1. Run IBKColour (or a real clean plate) into `c`; connect fg; leave bg empty.
+2. Take only the alpha: this alpha is the detail-edge component. Its body may be soft, grey or have holes; that is acceptable at this stage. Keep the area outside the subject as black as possible without losing detailed edges, or background noise propagates through ChannelMerge: Grade this alpha only, before combining, with slight black crush if needed; never touch RGB or require an opaque core here.
+3. Build a separate opaque core alpha (see fundamentals/keying-conventions and topics/combine-keys): contract it with FilterErode positive then Blur of similar size; 5-10 px is an HD example/artist preference, not a limit, and higher resolution may need more, set by edge quality and how far the core must contract. Combine core and edge by union/max with nodes/channelmerge, Copy the final alpha to the retained RGB, then despill and premultiply as the next Merge expects.
+4. Judge the result visually, tune weights and, only if the shot needs it, `ll_enable` plus `luma`; repeat. Screenshots and back-and-forth refinement are normal.
 
 ## Verify
-Composite the result with Merge, inspect edges, spill and alpha against the actual background, and check the clean plate. Runtime verified: false; availability, knobs and defaults may differ in the installed build.
+Final combined alpha must have a solid core with no holes and intact hair/motion-blur edges, checked over the actual background and against the original screen. Component IBK edges with body holes are acceptable; the final matte is not. Verify the clean plate against the original outside the subject. Runtime verified: false.
 
 ## Pitfalls
-Conditional practice: output is premultiplied and not a finished comp; Foundry's IBK page also suggests Keymix to split IBKGizmos. Clean plate quality limits the key. Studio policy (studio-conventions; project preference, not a Foundry rule): default to taking only IBKGizmo's alpha on the shared original or cleaned RGB, merge regional alphas with nodes/channelmerge, Copy the final alpha to the retained RGB, then despill, edge treatment and the premultiplication the next Merge expects; keep Keymix splits as an explicit option (fundamentals/keying-conventions).
+- Premultiplied output is not a finished comp; do not Merge it as-is over a background without checking.
+- Clean plate quality limits the key.
+- Crushing alpha with Grade black is for suppressing background noise on the edge matte: slight, alpha only, never a broad hard clip that eats hair, motion blur or soft edges.
+- Use `ChannelMerge` union/max for core + edge, not multiply (multiply only for regional-mask intersection).
+- Keymix splits remain an explicit option (Foundry page); default studio route takes only alpha.
 
 ## Sources
-- Foundry Nuke documentation: https://learn.foundry.com/nuke/17.1/content/reference_guide/keyer_nodes/ibkgizmo.html
+- Foundry Nuke documentation: https://learn.foundry.com/nuke/17.1/content/reference_guide/keyer_nodes/ibkgizmo.html (installed copy: Documentation/html/content/reference_guide/keyer_nodes/ibkgizmo.html; plugins/IBKGizmoV3.gizmo)
 - Studio policy: studio-conventions (teacher-supplied production conventions; project preferences, not universal Nuke facts).

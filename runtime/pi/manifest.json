@@ -47,8 +47,15 @@
     "tarball_integrity": "sha512-Z41LpZ3yYHSC/UUps6Mr39UMFPwH8elhJBG9DY1P7kuzsE5qSK/6eMj2EHzO5evJRQWLbKSqUMw+4nCNtIyiQg==",
     "rpc_entry": "node_modules/@earendil-works/pi-coding-agent/dist/bundle/rpc-entry.js",
     "cli_entry": "node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
-    "package_json_sha256": "12f5745f99e8991663d41f4b50f9498c25521937bb24dec24ee6be22c8be2462",
-    "package_lock_sha256": "9c7f60dfc23ca2871c68237813e872ebfe915d48349ffd9a72a9a57d713108c3"
+    "package_json_sha256": "cfa7e6eb21aafe87812aec61a94cde53b9d14abb63a2315868d471da29357b66",
+    "package_lock_sha256": "4d17efadefad42e42aad264401b158a004a3a01eb1aa5aefe2e0e3e48f00a927"
+  },
+  "ask_user": {
+    "package": "pi-ask-user",
+    "version": "0.17.1",
+    "tarball_integrity": "sha512-yFFw9PLP/iUZm7d8orvjkRW/vz3+Iru8nK413hMN9ilXXURgB93xNF25ORvRIZYGOyvJeXbr0xrEGMPtP/ab/Q==",
+    "entry": "node_modules/pi-ask-user/index.ts",
+    "tool": "ask_user"
   },
   "credential_env": {
     "file": "credential-env.json",

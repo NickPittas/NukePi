@@ -4,7 +4,7 @@ kind: "node"
 title: "Keylight"
 category: "keying"
 summary: "Colour-difference keyer for blue or green screen with screen colour, matte, despill and optional garbage and holdout masks."
-aliases: ["Keylight node", "green screen key", "blue screen key", "color difference keyer"]
+aliases: ["Keylight node", "OFXuk.co.thefoundry.keylight.keylight_v201", "green screen key", "blue screen key", "color difference keyer"]
 tags: ["key", "chroma", "despill", "matte"]
 requires: ["fundamentals/alpha-premultiplication", "fundamentals/color-spaces"]
 related: ["nodes/primatte", "nodes/keyer", "nodes/ibkgizmo", "topics/combine-keys", "nodes/channelmerge", "nodes/copy"]

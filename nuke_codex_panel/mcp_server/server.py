@@ -47,6 +47,9 @@ CONTROL_ERROR_CODES = frozenset(
     {"control_paused", "control_stale", "control_mismatch", "control_closed", "control_retired"}
 )
 
+# error_code with which the bridge refuses a scene change until the person has been asked (bridge.question_gate).
+QUESTION_GATE_ERROR_CODE = "ask_before_further_changes"
+
 API_QUERY_CAP = api_docs.MAX_QUERY_CHARS
 API_SEARCH_LIMIT_MAX = api_docs.MAX_LIMIT
 API_SEARCH_LIMIT_DEFAULT = api_docs.DEFAULT_LIMIT
@@ -66,11 +69,22 @@ TOOLS = [
             "This is the normal way to inspect or manipulate Nuke: create, connect, delete and "
             "configure nodes, run trackers, paint, roto, keying, projection, render, anything "
             "the Nuke Python API can do. Nothing needs to be read, inspected or documented first; "
-            "the whole script is compiled before anything runs. Syntax errors run nothing. "
+            "the whole script is compiled before anything runs; a planned multi-node tree can be built "
+            "in one batch instead of one call per node. Syntax errors run nothing. "
             "A runtime error reports phase, what already executed, the failing location and the "
             "partial graph changes (they are not undone or replayed). Results report graph_changed, "
-            "added/removed/modified nodes and node errors. Prefer native nodes and knobs over "
-            "expressions or scripted stand-ins (e.g. Roto for shapes, CheckerBoard for checkers). "
+            "added/removed/modified nodes and node errors. A successful result is the observed state: continue "
+            "from it and read the graph or capture an image only for what it does not report, to judge an "
+            "image, or after outside edits or an unknown/partial failure; node_errors on a successful call "
+            "are node problems to fix, not a failed call. Prefer native nodes and knobs over "
+            "expressions or scripted stand-ins (e.g. Roto for shapes, CheckerBoard2 for checkers when installed). "
+            "For new nodes prefer the current documented generation available in this Nuke that fits the task; "
+            "a numeric suffix alone is not proof, and existing legacy nodes stay unless an upgrade is requested. "
+            "If a node label or guessed class fails to create, it is unresolved, not absent: read "
+            "nuke.nodeTypes(force_plugin_load=True) and filter for the label incl. OFX/version-suffixed names. "
+            "If the returned identifier still fails or nothing matches, stay unresolved: check the menu "
+            "label-to-class mapping, Tcl aliases, plugin load errors and runtime availability. Substitute "
+            "another node only after that evidence shows it unavailable; enumeration alone does not. "
             "Optional on demand references: search_compositing_knowledge / get_compositing_guidance "
             "(section='workflow' holds exact native Python for Viewer sampling, tracking, roto/paint, "
             "warping, calibration, analysis, baking, keying). When a result reports api_errors, "
@@ -267,20 +281,21 @@ KNOWLEDGE_TOOLS = frozenset(
 
 API_DOC_TOOLS = frozenset({"search_nuke_api_docs", "read_nuke_api_doc"})
 
-MUTATION_REMINDER = (
-    "The graph changed. get_nuke_context and a nodegraph or Viewer capture show the result when you want to "
-    "see it; nothing is required before your next Python."
+DO_NOT_REPEAT = "Fix the reported cause; do not repeat the same call unchanged."
+
+FAILED_REMINDER = "This call failed. " + DO_NOT_REPEAT
+
+UNCHANGED_FAILURE_REMINDER = "This call failed and the graph did not change (graph_changed is false). " + DO_NOT_REPEAT
+
+CHANGED_FAILURE_REMINDER = (
+    "The graph changed (see the changes above) and the call then failed or was not delivered intact. "
+    "Nothing was undone or replayed. " + DO_NOT_REPEAT
 )
 
-UNKNOWN_MUTATION_REMINDER = (
-    "The server could not determine whether this call changed the graph; treat it as possibly changed. " + MUTATION_REMINDER
+UNKNOWN_EFFECT_REMINDER = (
+    "The server could not determine whether this call changed the graph, so its effect is unknown. "
+    "Read back only the nodes it touched before depending on them."
 )
-
-ERROR_REMINDER = """ERROR — THIS OPERATION IS NOT VERIFIED
-
-Read the error details above. Do not assume the operation was rolled back.
-Inspect the current state before retrying, and address the reported cause.
-Do not repeat the same failing command unchanged."""
 
 
 def _discover_bridge() -> dict:
@@ -342,20 +357,22 @@ def _bridge_call(method: str, params: dict) -> dict:
     return json.loads(chunks.split(b"\n", 1)[0].decode("utf-8"))
 
 
-def _confirm_delivery(tokens: list) -> str | None:
+def _confirm_delivery(tokens: list) -> tuple[str | None, str | None]:
     """Tell the bridge the evidence behind ``tokens`` is being handed to the model.
 
-    Returns the problem text if the bridge did not record it, else None.
+    Returns ``(problem, notice)``: the problem text if the bridge did not record it, else None; and the
+    bridge's note to the model when this delivery armed the ask-before-further-changes gate, else None.
     """
     try:
         reply = _bridge_call("confirm_delivery", {"tokens": tokens})
     except Exception as exc:
-        return "%s: %s" % (type(exc).__name__, exc)
+        return "%s: %s" % (type(exc).__name__, exc), None
     if not isinstance(reply, dict):
-        return "malformed bridge response: %r" % (reply,)
+        return "malformed bridge response: %r" % (reply,), None
     if not reply.get("success"):
-        return str(reply.get("error") or reply)
-    return None
+        return str(reply.get("error") or reply), None
+    notice = reply.get("question_gate_notice")
+    return None, notice if isinstance(notice, str) and notice else None
 
 
 def _knowledge_result(name: str, arguments: dict) -> dict:
@@ -488,9 +505,9 @@ def _tool_result(name: str, arguments: dict) -> dict:
     tokens = [token for token in [result.pop("delivery_token", None)] if token is not None]
     action_tokens = result.pop("delivery_tokens", None) or []
     images = result.pop("images", None) or []
-    if result.get("error_code") in CONTROL_ERROR_CODES:
-        # Refused before anything ran because the user interrupted this run: no mutation or retry
-        # reminder applies, and the refusal names the only correct behavior.
+    if result.get("error_code") in CONTROL_ERROR_CODES or result.get("error_code") == QUESTION_GATE_ERROR_CODE:
+        # Refused before anything ran (the user interrupted this run, or the person must be asked before
+        # more changes): no mutation or retry reminder applies, and the refusal names the only correct behavior.
         return {"content": [{"type": "text", "text": json.dumps(result, indent=2)}], "isError": True}
     content = [{"type": "text", "text": json.dumps(result, indent=2)}]
     if name == "capture_nuke_screenshot" and result.get("success") and result.get("path"):
@@ -514,10 +531,10 @@ def _tool_result(name: str, arguments: dict) -> dict:
             if position < len(action_tokens):
                 delivered.append(action_tokens[position])
         if name == "capture_nuke_screenshot":
-            # The single screenshot's own checkpoint token only counts if its image really attached.
+            # The single screenshot's own delivery token only counts if its image really attached.
             delivered = tokens if not unreadable else []
         if unreadable:
-            # Failed image delivery: those tokens are dropped unconfirmed, so they can never unlock.
+            # Failed image delivery: those tokens are dropped unconfirmed, so they are never counted.
             if name == "capture_nuke_screenshot":
                 result = {
                     "success": False,
@@ -534,7 +551,7 @@ def _tool_result(name: str, arguments: dict) -> dict:
 
     failed = not bool(result.get("success"))
     if delivered and not failed:
-        problem = _confirm_delivery(delivered)
+        problem, notice = _confirm_delivery(delivered)
         if problem is not None:
             failed = True
             content.append(
@@ -550,19 +567,22 @@ def _tool_result(name: str, arguments: dict) -> dict:
                     ),
                 }
             )
+        elif notice is not None:
+            content.append({"type": "text", "text": notice})
     if name in ("execute_python", "nuke_action"):
         changed = result.get("graph_changed")
-        if transport_failed or "graph_changed" not in result:
+        if transport_failed:
             # The call may have run (e.g. timeout after dispatch); state is not known.
             changed = None
-        if changed is None:
-            content.append({"type": "text", "text": UNKNOWN_MUTATION_REMINDER})
-        elif changed:
-            content.append({"type": "text", "text": MUTATION_REMINDER})
-        if failed or result.get("node_errors"):
-            content.append({"type": "text", "text": ERROR_REMINDER})
+        if changed is True and failed:
+            content.append({"type": "text", "text": CHANGED_FAILURE_REMINDER})
+        elif changed is False and failed:
+            content.append({"type": "text", "text": UNCHANGED_FAILURE_REMINDER})
+        elif changed is not True and changed is not False:
+            text = UNKNOWN_EFFECT_REMINDER + (" " + DO_NOT_REPEAT if failed else "")
+            content.append({"type": "text", "text": text})
     elif failed:
-        content.append({"type": "text", "text": ERROR_REMINDER})
+        content.append({"type": "text", "text": FAILED_REMINDER})
     # Only images that really sit in this result reach the panel preview.
     _announce_images(name, attached)
     return {"content": content, "isError": failed}

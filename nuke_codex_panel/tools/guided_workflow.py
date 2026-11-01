@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 import re
 from typing import Callable, Protocol
 
+from .graph_layout import check_merge_layout, review_layout
+
 FAMILIES = ("2d", "keying", "cleanup", "projection")
 
 MAX_CLIENTS = 64
@@ -35,6 +37,10 @@ MAX_EVIDENCE = 24
 MAX_HISTORY = 12
 MAX_STACK = 4
 MAX_ROLE = 32
+MAX_SCOPE = 200
+MAX_REPORT_NODES = 20
+MAX_REPORT_RENDERS = 4
+MAX_REPORT_ISSUES = 8
 
 # Observations must describe the picture in words; metrics alone never approve it.
 _MIN_OBSERVATION_CHARS = 30
@@ -44,6 +50,11 @@ _WORD = re.compile(r"[A-Za-z]{3,}")
 _ROLE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 GEOMETRY_PREFIXES = ("Card", "Cube", "Cylinder", "Sphere", "ReadGeo", "PoissonMesh", "ModelBuilder")
+# What shows "a foreground over a background" (B and A inputs); a composite built from anything else never
+# arms the ask-before-further-changes gate. Nodes that produce no image of their own are not "branches", and
+# neither is a Dot: it only routes (layout arrange leaves unconsumed waypoint Dots behind when it re-routes).
+COMPOSITE_CLASSES = ("Merge", "Merge2")
+NON_IMAGE_CLASSES = ("Viewer", "BackdropNode", "StickyNote", "Dot")
 
 
 class GraphFacts(Protocol):
@@ -95,6 +106,8 @@ class Evidence:
     delivered: bool = False
     invalid: str | None = None
     judged: bool = False
+    display: dict | None = None  # Viewer channel/display knobs at capture; None = not recorded
+    content_digest: str | None = None  # image-producing content at capture (Viewer state excluded); None = unknown
 
     def certification_problem(self) -> str | None:
         """Why this image cannot certify a Viewer render of a node at a frame, or None."""
@@ -131,6 +144,7 @@ def evidence_from_capture(capture: dict, digest: str | None, revision: int) -> E
         inputs_known=bool(capture.get("viewer_inputs_known")),
         digest=digest,
         revision=int(revision),
+        display=dict(capture["viewer_display"]) if isinstance(capture.get("viewer_display"), dict) and capture["viewer_display"] else None,
     )
 
 
@@ -203,19 +217,19 @@ _2D_MERGE = _step(
     "merge",
     "Merge Over on the background",
     "Create a Merge (operation over) whose B input (index 0) is the background. Leave A (index 1) "
-    "empty for now. Bind the Merge, then do a graph check.",
+    "empty for now. Bind the Merge.",
     bind="merge",
-    needs=("merge_over", "graph"),
+    needs=("merge_over",),
     guidance=(("nodes/merge", "inputs"),) + _graph_guidance(),
 )
 _2D_FOREGROUND = _step(
     "foreground",
     "Foreground element",
     "Build one foreground element (shapes start in Roto or RotoPaint), keep it unattached, view it "
-    "and review it, then do a graph check. Bind its output node.",
+    "and review it. Bind its output node.",
     bind="foreground",
     review="foreground",
-    needs=("foreground_free", "review", "graph"),
+    needs=("foreground_free", "review"),
     guidance=(("fundamentals/node-selection", "workflow"), ("nodes/roto", "controls")),
 )
 _2D_ATTACH = _step(
@@ -229,18 +243,18 @@ _2D_LAYOUT = _step(
     "layout",
     "Graph layout",
     "Lay the graph out top to bottom: B trunk vertical, the foreground branch entering A from the "
-    "side with room for its own tree. Then do a graph check.",
-    needs=("layout", "graph"),
+    "side with room for its own tree.",
+    needs=("layout",),
     guidance=_graph_guidance(),
 )
 _2D_COMPOSITE = _step(
     "composite",
     "Composite review",
     "View the Merge and review the composite. Animated work needs several frames including the "
-    "ending. Then do a graph check.",
+    "ending.",
     review="merge",
     motion=True,
-    needs=("review", "graph"),
+    needs=("review",),
     guidance=(("fundamentals/quality-safeguards", "verify"),),
 )
 _2D_NEXT = _step(
@@ -278,18 +292,26 @@ KEYING = (
     _step(
         "key",
         "Alpha-only key",
+        "Plan the regional, core/edge, garbage and optional IBK structure first; read combine-keys and, "
+        "for IBK, get_node_reference IBKGizmoV3 / IBKColourV3 with section=\"full\" (its Workflow); build "
+        "the whole known network in one batch, then tune it by ordinary knob and Viewer back-and-forth. "
         "Build the key(s) as alpha only, separate from the RGB branch; assemble regional mattes with "
         "ChannelMerge. View the matte alpha and review it. Bind the final matte node.",
         bind="matte",
         review="matte",
         needs=("review",),
-        guidance=(("topics/chroma-keying", "workflow"), ("nodes/channelmerge", "inputs")),
+        guidance=(
+            ("topics/combine-keys", "workflow"),
+            ("topics/chroma-keying", "workflow"),
+            ("nodes/channelmerge", "inputs"),
+        ),
     ),
     _step(
         "copy_alpha",
         "Copy alpha onto retained RGB",
-        "Copy the final matte alpha onto the original or cleaned RGB: Copy with B = RGB, A = matte. "
-        "Bind the Copy node.",
+        "Copy the final matte alpha onto the original or cleaned RGB: on Copy, input 0 (B) is the retained "
+        "RGB and input 1 (A) is the matte. Check the Copy's channel knobs (nuke_action inspect) and that "
+        "its output alpha is the matte before changing anything else. Bind the Copy node.",
         bind="keyed",
         needs=("copy_alpha",),
         guidance=(("nodes/copy", "inputs"), ("fundamentals/alpha-premultiplication", "workflow")),
@@ -311,7 +333,7 @@ KEYING = (
         "several frames for motion.",
         review="final",
         motion=True,
-        needs=("review", "graph"),
+        needs=("review",),
         guidance=(("fundamentals/keying-conventions", "verify"),),
     ),
 )
@@ -341,7 +363,7 @@ CLEANUP = (
         "View the cleaned result and review it across several frames, including the fix region.",
         review="fixed",
         motion=True,
-        needs=("review", "graph"),
+        needs=("review",),
         guidance=(("fundamentals/quality-safeguards", "verify"),),
     ),
 )
@@ -402,10 +424,9 @@ PROJECTION = (
     _step(
         "handoff",
         "2D hand-off",
-        "Return the controlled 2D result with one labelled Dot after the render. Bind the Dot, then "
-        "do a graph check.",
+        "Return the controlled 2D result with one labelled Dot after the render. Bind the Dot.",
         bind="handoff",
-        needs=("handoff", "graph"),
+        needs=("handoff",),
         guidance=_graph_guidance(),
     ),
 )
@@ -451,18 +472,20 @@ class ClientState:
     next_id: int = 1
     animated_nodes: set = field(default_factory=set)
     project_changed: bool = False
+    # node name -> {"node_class", "purpose", "treatment_id"}
+    node_use: dict = field(default_factory=dict)
+    # node name -> set of "action" | "python"
+    scope: dict = field(default_factory=dict)
+    caveats: set = field(default_factory=set)
 
 
 class _Context:
     """What a requirement check can see."""
 
-    def __init__(self, workflow, facts, missing_inspection, state, lenient=False):
+    def __init__(self, workflow, facts, state):
         self.workflow = workflow
         self.facts = facts
-        self.missing_inspection = missing_inspection
         self.state = state
-        # Brief status inside action results has no inspection report: do not claim one is owed.
-        self.lenient = lenient
 
     def role_node(self, role):
         """``(fact, problem)`` for a bound role."""
@@ -479,15 +502,6 @@ def _check_project(context):
     if context.workflow.project_ack:
         return None
     return "project not confirmed: nuke_action project (changes) or advance with project=\"keep\""
-
-
-def _check_graph(context):
-    missing = context.missing_inspection
-    if missing is None:
-        return None if context.lenient else "graph check unavailable: the bridge did not report inspection status"
-    if missing:
-        return "graph check owed: " + "; ".join(missing)
-    return None
 
 
 def _inputs(fact):
@@ -551,34 +565,42 @@ def _check_attach(context):
     return None
 
 
-_LAYOUT_COLUMN_TOLERANCE = 20
-_LAYOUT_SIDE_MIN = 70
 
-
-def _check_layout(context):
-    merge, problem = context.role_node("merge")
-    if problem:
-        return problem
-    background, problem = context.role_node("background")
-    if problem:
-        return problem
-    foreground, problem = context.role_node("foreground")
-    if problem:
-        return problem
-    issues = []
-    if abs(merge["x"] - background["x"]) > _LAYOUT_COLUMN_TOLERANCE:
-        issues.append("Merge %s is not in the B column of %s (x %s vs %s)" % (merge["name"], background["name"], merge["x"], background["x"]))
-    if merge["y"] <= background["y"]:
-        issues.append("Merge %s must sit below its B input %s" % (merge["name"], background["name"]))
-    if abs(foreground["x"] - merge["x"]) < _LAYOUT_SIDE_MIN:
-        issues.append("foreground %s must enter A from the left or right side, not stack on the B trunk" % foreground["name"])
-    if foreground["y"] >= merge["y"]:
-        issues.append("foreground %s must sit above the Merge %s" % (foreground["name"], merge["name"]))
-    return "; ".join(issues) or None
+def _inside_any(name: str, parents) -> bool:
+    """True when ``name`` is a child (at any depth) of a node in ``parents`` (full dotted names)."""
+    parts = name.split(".")
+    return any(".".join(parts[:end]) in parents for end in range(1, len(parts)))
 
 
 def _check_decision(context):
     return "decision pending: advance with next=\"layer\" or next=\"finish\""
+
+
+def _view_mode(display) -> str | None:
+    """'rgb' or 'alpha' from the Viewer's channels and layer_display_style; None when unknown.
+
+    Alpha: channels is the single 'alpha' channel, or style is 'Alpha' on a colour channel set (or unrecorded channels).
+    RGB: style 'RGB' on a colour channel set ('rgb'/'rgba'). Anything else (a single colour channel, another
+    layer such as depth or mask, a missing style) is unknown, never guessed as rgb.
+    """
+    display = display or {}
+    channels = str(display.get("channels") or "").strip().lower()
+    style = str(display.get("layer_display_style") or "").strip().lower()
+    if channels == "alpha":
+        return "alpha"
+    if style == "alpha" and channels in ("", "rgb", "rgba"):
+        return "alpha"
+    if style == "rgb" and channels in ("rgb", "rgba"):
+        return "rgb"
+    return None
+
+
+def _content_current(item, content_digest) -> bool:
+    """True only when the render was not invalidated and its image content matches the current content.
+
+    Unknown fingerprints (an old capture, or content_digest unavailable) are never current.
+    """
+    return not item.invalid and content_digest is not None and item.content_digest == content_digest
 
 
 def _upstream_has(context, fact, role):
@@ -596,16 +618,30 @@ def _check_copy_alpha(context):
         return problem
     if keyed["class"] not in ("Copy", "ShuffleCopy"):
         return "keyed node %s is class %s; Copy (or ShuffleCopy) is required to move the alpha onto RGB" % (keyed["name"], keyed["class"])
-    if not _input(keyed, 0) or not _input(keyed, 1):
-        return "Copy needs B (index 0) = retained RGB and A (index 1) = matte"
+    ports = [_input(keyed, 0), _input(keyed, 1)]
+    if not all(ports):
+        return "Copy needs both inputs connected, the retained RGB and the matte (inputs now: index 0 %r, index 1 %r)" % tuple(ports)
     rgb_role = "clean" if context.workflow.targets.get("clean") else "plate"
-    problem = _upstream_has_via(context, _input(keyed, 0), rgb_role)
-    if problem:
-        return "Copy B (index 0): " + problem
-    problem = _upstream_has_via(context, _input(keyed, 1), "matte")
-    if problem:
-        return "Copy A (index 1): " + problem
-    return None
+    rgb_node, matte_node = context.workflow.targets.get(rgb_role), context.workflow.targets.get("matte")
+    carries_matte = [_upstream_has_via(context, port, "matte") is None for port in ports]
+    carries_rgb = [_upstream_has_via(context, port, rgb_role) is None for port in ports]
+    if keyed["class"] == "Copy":
+        # Observed in the official Nuke 17.1v2 GUI: Copy input 0 is B (the base RGB), input 1 is A (the copied matte).
+        if carries_rgb[0] and not carries_matte[0] and carries_matte[1]:
+            return None
+        return (
+            "Copy input 0 (B) is %r and input 1 (A) is %r; input 0 must be the retained %s %s without the "
+            "matte and input 1 the matte %s. Reconnect those two ports."
+            % (ports[0], ports[1], rgb_role, rgb_node, matte_node)
+        )
+    # ShuffleCopy: its port order is not established here, so only the roles are required.
+    if any(carries_matte) and any(rgb and not matte for rgb, matte in zip(carries_rgb, carries_matte)):
+        return None
+    return (
+        "ShuffleCopy inputs are index 0 %r and index 1 %r; one must be the retained %s %s without the matte, "
+        "the other the matte %s. Confirm which port is which from the node itself (nuke_action inspect)."
+        % (ports[0], ports[1], rgb_role, rgb_node, matte_node)
+    )
 
 
 def _upstream_has_via(context, source_name, role):
@@ -699,11 +735,10 @@ def _check_handoff(context):
 
 _CHECKS: dict[str, Callable[[_Context], str | None]] = {
     "project": _check_project,
-    "graph": _check_graph,
     "merge_over": _check_merge_over,
     "foreground_free": _check_foreground_free,
     "attach": _check_attach,
-    "layout": _check_layout,
+    "layout": check_merge_layout,
     "decision": _check_decision,
     "copy_alpha": _check_copy_alpha,
     "treated": _check_treated,
@@ -754,6 +789,8 @@ class WorkflowEngine:
             for item in state.evidence:
                 if not item.invalid:
                     item.invalid = reason
+            if client_id is not None and reason == "outside_scope":
+                state.caveats.add("an action changed nodes it did not declare; the recorded node scope may be incomplete")
 
     # ---- evidence ----
 
@@ -762,6 +799,7 @@ class WorkflowEngine:
         if not capture.get("evidence_id"):
             return None
         evidence = evidence_from_capture(capture, self.facts.digest(), revision)
+        evidence.content_digest = self._content_digest()
         state = self._state(client_id)
         state.evidence.append(evidence)
         del state.evidence[:-MAX_EVIDENCE]
@@ -775,18 +813,19 @@ class WorkflowEngine:
             for item in state.evidence:
                 if item.evidence_id == evidence_id:
                     item.delivered = True
-                    return {"evidence_id": evidence_id, "delivered": True}
+                    return self._delivery_record(state, item)
         if evidence.get("target") != "viewer" or not evidence_id:
             return None
         # A Viewer capture made outside nuke_action: it counts only for the graph it saw.
         if evidence.get("graph_revision") != revision:
             return {"evidence_id": evidence_id, "delivered": False, "stale": True}
         item = evidence_from_capture(evidence, self.facts.digest(), revision)
+        item.content_digest = self._content_digest()
         item.delivered = True
         state = self._state(client_id)
         state.evidence.append(item)
         del state.evidence[:-MAX_EVIDENCE]
-        return {"evidence_id": evidence_id, "delivered": True}
+        return self._delivery_record(state, item)
 
     def note_action(self, client_id: str, action: str, arguments: dict, result: dict) -> None:
         """A successful guided action: remember facts the graph alone cannot show."""
@@ -801,9 +840,346 @@ class WorkflowEngine:
         if action in ("animate", "shape_key") and arguments.get("node"):
             state.animated_nodes.add(str(arguments["node"]))
 
+    # ---- node use, scope and completion report (what this conversation did; never permission) ----
+
+    def record_node_use(self, client_id, node_name, node_class, purpose, treatment_id, review_channels=None) -> None:
+        """This conversation created or inspected ``node_name`` for ``purpose`` (treatment page ``treatment_id``).
+
+        ``review_channels`` is the treatment's own list of views ("rgb"/"alpha") a review needs; None/empty = unknown.
+        """
+        if not client_id or not node_name:
+            return
+        state = self._state(client_id)
+        state.node_use.pop(str(node_name), None)
+        if node_class is None and purpose is None and treatment_id is None:
+            return  # explicit forget: the node was deleted or renamed
+        state.node_use[str(node_name)] = {
+            "node_class": str(node_class or ""),
+            "purpose": str(purpose) if purpose else None,
+            "treatment_id": str(treatment_id) if treatment_id else None,
+            "review_channels": [
+                mode for mode in ("rgb", "alpha") if mode in {str(item).strip().lower() for item in (review_channels or ())}
+            ],
+        }
+        while len(state.node_use) > MAX_SCOPE:
+            state.node_use.pop(next(iter(state.node_use)))
+
+    def node_use(self, client_id, node_name) -> dict | None:
+        """The recorded use of a node, or None when unknown or stale (deleted, or its class changed)."""
+        state = self._clients.get(client_id)
+        use = state.node_use.get(str(node_name)) if state is not None else None
+        if use is None:
+            return None
+        fact = self._fact(node_name)
+        if fact is None or (use["node_class"] and fact.get("class") != use["node_class"]):
+            return None
+        result = dict(use)
+        if not result["treatment_id"]:
+            result["unresolved"] = True  # intent recorded without a documented treatment; never reuse older guidance
+        return result
+
+    def record_scope(self, client_id, nodes, source: str = "action") -> None:
+        """Nodes this conversation actually touched. ``source`` is "action" or "python" (diagnostic only)."""
+        names = [str(name) for name in (nodes or ()) if name]
+        if not client_id or not names:
+            return
+        state = self._state(client_id)
+        for name in names:
+            sources = state.scope.pop(name, set())
+            sources.add(source)
+            state.scope[name] = sources
+        while len(state.scope) > MAX_SCOPE:
+            state.scope.pop(next(iter(state.scope)))
+
+    def record_python_delta(self, client_id, added, removed, modified) -> None:
+        """Raw Python's actual graph delta: seeds diagnostics, never ownership.
+
+        Generated children of a node the same run created (a gizmo's internals) are not recorded.
+        Deleted nodes lose their scope and purpose; a re-created name loses its stale purpose.
+        """
+        if not client_id:
+            return
+        added, removed = set(added or ()), set(removed or ())
+        state = self._state(client_id)
+        for name in removed | added:
+            state.node_use.pop(name, None)
+        for name in removed:
+            state.scope.pop(name, None)
+        seen = [name for name in list(added) + list(modified or ()) if name not in removed and not _inside_any(name, added)]
+        self.record_scope(client_id, seen, source="python")
+
+    # ---- complete composite (arms the ask-before-further-changes gate) ----
+
+    def _delivery_record(self, state, item) -> dict:
+        """The reply for one delivered image.
+
+        ``complete_composite`` is present when it is an RGB render of a complete composite's output;
+        otherwise ``complete_network`` is present when it reviews any node upstream of such an output.
+        Both are ``{node: output, merge, ...}``; anything unknown means neither.
+        """
+        record = {"evidence_id": item.evidence_id, "delivered": True}
+        if item.certification_problem() is not None or not _content_current(item, self._content_digest()):
+            return record
+        target = self._through_dots(item.node)
+        if target is None:
+            return record
+        terminals = self._composite_terminals(state)
+        for terminal in terminals:
+            if terminal["node"] == target:
+                if _view_mode(item.display) == "rgb":
+                    record["complete_composite"] = {"node": target, "merge": terminal["merge"], "frame": item.frame}
+                    return record
+                break
+        for terminal in terminals:
+            if target in terminal["upstream"]:
+                record["complete_network"] = {"node": terminal["node"], "merge": terminal["merge"]}
+                break
+        return record
+
+    def _through_dots(self, name) -> str | None:
+        """The real root-level image node a review of ``name`` shows (Dots are followed to their source), else None."""
+        seen = set()
+        while name and name not in seen:
+            seen.add(name)
+            fact = self._fact(name)
+            if fact is None or "." in fact["name"]:
+                return None
+            if fact.get("class") == "Dot":
+                inputs = _inputs(fact)
+                name = inputs[0] if inputs else None
+                continue
+            return None if fact.get("class") in NON_IMAGE_CLASSES else fact["name"]
+        return None
+
+    def _composite_terminals(self, state) -> list:
+        """Every complete composite output in the live graph: ``[{node, merge, upstream}]``, else empty.
+
+        From live graph facts only (anything unknown means no terminal). A terminal is a root-level image node
+        nothing reads (Viewers, backdrops, notes and Dots never count as readers; a Dot only passes its source
+        on) whose upstream (a) holds a Merge/Merge2 with both B and A connected to different branches, and
+        (b) contains every image node this conversation touched (none touched is fine: a scene loaded from a
+        file, or one the user built). Unrelated terminals, and a graph whose authored nodes do not all feed the
+        same output, never qualify; so nothing arms while branches are still unconnected.
+        """
+        listing = getattr(self.facts, "root_nodes", None)
+        if listing is None:
+            return []
+        try:
+            by_name = {node["name"]: node for node in listing()}
+
+            def source(name):
+                seen = set()
+                while name in by_name and by_name[name]["class"] == "Dot" and name not in seen:
+                    seen.add(name)
+                    inputs = by_name[name]["inputs"]
+                    name = inputs[0] if inputs else None
+                return name
+
+            consumed = set()
+            for node in by_name.values():
+                if node["class"] not in NON_IMAGE_CLASSES:
+                    consumed.update(source(name) for name in node["inputs"] if name)
+            authored = set()
+            for name in state.scope:
+                fact = None if name.startswith("<") or "." in name else self._fact(name)
+                if fact is not None and fact.get("class") not in NON_IMAGE_CLASSES:
+                    authored.add(fact["name"])
+            found, cache = [], {}
+
+            def upstream(name):
+                if name not in cache:
+                    cache[name] = set(self.facts.upstream(name))
+                return cache[name]
+
+            for name in sorted(by_name):
+                if by_name[name]["class"] in NON_IMAGE_CLASSES or name in consumed:
+                    continue
+                above = upstream(name)
+                if not authored <= above:
+                    continue
+                for member in sorted(above):
+                    node = by_name.get(member)
+                    inputs = list(node["inputs"]) if node is not None and node["class"] in COMPOSITE_CLASSES else []
+                    if len(inputs) >= 2 and inputs[0] and inputs[1] and upstream(inputs[0]) != upstream(inputs[1]):
+                        found.append({"node": name, "merge": member, "upstream": above})
+                        break
+            return found
+        except Exception:
+            return []
+
+    def completion_report(self, client_id) -> dict:
+        """Factual record for the conversation's nodes: purpose, output delivery, assessment, layout.
+
+        It never certifies quality. No recorded assessment does not mean nobody looked, and a mode the
+        capture did not record is reported as unknown.
+        """
+        state = self._clients.get(client_id)
+        if state is None:
+            return {"nodes": []}
+        rendered = [item.node for item in state.evidence if item.node and item.target == "viewer"]
+        if not (state.scope or state.node_use or rendered):
+            return {"nodes": []}
+        digest = self._content_digest()
+        names = [
+            name
+            for name in dict.fromkeys(list(state.scope) + list(state.node_use) + rendered)
+            if (self._fact(name) or {}).get("class") != "Viewer"  # Viewers are inspection state, never authored nodes
+        ]
+        entries, unknown_modes, present = [], 0, []
+        for name in names[:MAX_REPORT_NODES]:
+            entry = {"node": name}
+            sources = state.scope.get(name)
+            if sources:
+                entry["recorded_by"] = sorted(sources)
+                if sources == {"python"}:
+                    entry["diagnostic_only"] = "seen in raw Python's graph delta; not claimed as this conversation's design"
+            fact = self._fact(name)
+            rendered_only = not sources and name not in state.node_use
+            if fact is None:
+                entry["state"] = "no longer exists"
+                entries.append(entry)
+                continue
+            entry["class"] = fact.get("class")
+            if not rendered_only:
+                present.append(name)
+            else:
+                entry["rendered_only"] = "rendered by this conversation; not recorded as created or edited by it"
+            use = state.node_use.get(name)
+            if use is None:
+                entry["purpose"] = "not recorded"
+            elif use["node_class"] and use["node_class"] != fact.get("class"):
+                entry["purpose"] = "unknown: the node's class changed after the purpose was recorded"
+            else:
+                entry["purpose"] = use["purpose"] or "not stated"
+                if use["treatment_id"]:
+                    entry["treatment"] = use["treatment_id"]
+                else:
+                    entry["treatment"] = "unresolved: no documented treatment was selected for this purpose"
+            shown = [item for item in state.evidence if item.node == name]
+            if not shown:
+                entry["output"] = "no Viewer render of this node was recorded by this conversation"
+            else:
+                records = []
+                for item in shown[-MAX_REPORT_RENDERS:]:
+                    current = _content_current(item, digest)
+                    record = {
+                        "frame": item.frame,
+                        "delivered": item.delivered,
+                        "content_unchanged_since": current,
+                        "assessment_recorded": item.judged,
+                        "viewer_mode": item.display if item.display else "unknown",
+                        "view_mode": _view_mode(item.display) or "unknown",
+                    }
+                    if item.invalid:
+                        record["invalidated"] = item.invalid
+                    problem = item.certification_problem()
+                    if problem:
+                        record["not_certifiable"] = problem
+                    if not item.display:
+                        unknown_modes += 1
+                    records.append(record)
+                entry["renders"] = records
+                entry["output"] = self._output_state(shown, digest)
+            if use is not None and use.get("review_channels") and entry["purpose"] == use["purpose"]:
+                entry["review_modes"] = self._review_modes(use["review_channels"], shown, digest)
+            entries.append(entry)
+        report = {
+            "nodes": entries,
+            "note": (
+                "factual record of this conversation's operations; it does not certify image quality. "
+                "No recorded assessment does not mean nobody looked."
+            ),
+        }
+        if len(names) > MAX_REPORT_NODES:
+            report["omitted_nodes"] = len(names) - MAX_REPORT_NODES
+        unknowns = []
+        if unknown_modes:
+            unknowns.append("%d render(s) recorded no Viewer channel/display mode" % unknown_modes)
+        unknowns.extend(sorted(state.caveats))
+        layout = self._layout_report(present)
+        if layout is not None:
+            report["layout_report"] = layout
+        if unknowns:
+            report["unknowns"] = unknowns
+        return report
+
+    @staticmethod
+    def _review_modes(expected, shown, digest) -> dict:
+        """Views the treatment says a review needs vs the views actually delivered for the current graph."""
+        viewed, unconfirmed = set(), 0
+        for item in shown:
+            if not item.delivered or not _content_current(item, digest):
+                continue
+            mode = _view_mode(item.display)
+            if mode:
+                viewed.add(mode)
+            else:
+                unconfirmed += 1
+        result = {
+            "expected": list(expected),
+            "viewed": sorted(viewed),
+            "missing": [mode for mode in expected if mode not in viewed],
+        }
+        if unconfirmed:
+            result["unconfirmed_renders"] = unconfirmed
+            result["note"] = "those renders recorded no recognisable view mode, so 'missing' may include views that were shown"
+        return result
+
+    @staticmethod
+    def _output_state(shown, digest) -> str:
+        current = [item for item in shown if _content_current(item, digest)]
+        if any(item.judged and item.delivered for item in current):
+            return "assessment_recorded"
+        if any(item.delivered for item in current):
+            return "delivered_no_assessment_recorded"
+        if current:
+            return "rendered_not_delivered"
+        return "only_stale_renders"
+
+    def _layout_report(self, names) -> dict | None:
+        gather = getattr(self.facts, "layout_nodes", None)
+        if gather is None or not names:
+            return None
+        top = [name for name in names if "." not in name]
+        skipped = len(names) - len(top)
+        if not top:
+            return {
+                "reviewed": [],
+                "issues": [],
+                "unknowns": ["%d node(s) are inside groups and were not layout-reviewed (no root-level nodes to review)" % skipped],
+            }
+        try:
+            review = review_layout(gather(top))
+        except Exception as exc:
+            return {"unknowns": ["layout review failed: %s: %s" % (type(exc).__name__, exc)]}
+        report = {
+            "reviewed": list(review.get("reviewed") or [])[:MAX_REPORT_NODES],
+            "issues": list(review.get("issues") or [])[:MAX_REPORT_ISSUES],
+            "unknowns": list(review.get("unknowns") or [])[:MAX_REPORT_ISSUES],
+        }
+        if skipped:
+            report["unknowns"].append("%d node(s) inside groups were not layout-reviewed" % skipped)
+        return report
+
+    def _fact(self, name):
+        try:
+            return self.facts.node(str(name))
+        except Exception:
+            return None
+
+    def _content_digest(self):
+        """Fingerprint of image-producing content (Viewer inspection state excluded); None when unavailable."""
+        method = getattr(self.facts, "content_digest", None)
+        if method is None:
+            return None
+        try:
+            return method()
+        except Exception:
+            return None
+
     # ---- public requests ----
 
-    def request(self, client_id: str, arguments: dict, missing_inspection) -> dict:
+    def request(self, client_id: str, arguments: dict) -> dict:
         action = str(arguments.get("action") or "")
         handlers = {
             "begin": self._begin,
@@ -817,11 +1193,11 @@ class WorkflowEngine:
         handler = handlers.get(action)
         if handler is None:
             raise WorkflowError("unknown workflow action %r; one of %s" % (action, ", ".join(handlers)))
-        return handler(client_id, arguments, missing_inspection)
+        return handler(client_id, arguments)
 
     # ---- handlers ----
 
-    def _begin(self, client_id, arguments, missing_inspection):
+    def _begin(self, client_id, arguments):
         family = arguments.get("family")
         if family not in FAMILIES:
             raise WorkflowError("family must be one of %s, got %r" % (", ".join(FAMILIES), family))
@@ -848,17 +1224,17 @@ class WorkflowEngine:
             workflow.project_ack = True  # project settings only gate 2d layer work
         state.stack.append(workflow)
         workflow.log("begin %s" % family)
-        return self._snapshot(client_id, workflow, missing_inspection, guidance=True)
+        return self._snapshot(client_id, workflow, guidance=True)
 
-    def _current(self, client_id, arguments, missing_inspection):
+    def _current(self, client_id, arguments):
         workflow = self._require(client_id)
-        return self._snapshot(client_id, workflow, missing_inspection, guidance=bool(arguments.get("guidance", True)))
+        return self._snapshot(client_id, workflow, guidance=bool(arguments.get("guidance", True)))
 
-    def _bind(self, client_id, arguments, missing_inspection):
+    def _bind(self, client_id, arguments):
         workflow = self._require(client_id)
         role = arguments.get("role") or workflow.step.get("bind")
         self._bind_role(workflow, role, arguments.get("node"))
-        return self._snapshot(client_id, workflow, missing_inspection)
+        return self._snapshot(client_id, workflow)
 
     def _bind_role(self, workflow, role, name):
         if not isinstance(role, str) or not _ROLE.match(role):
@@ -934,7 +1310,7 @@ class WorkflowEngine:
             return 2, None, "a sequence"
         return 1, None, "a still"
 
-    def _review(self, client_id, arguments, missing_inspection):
+    def _review(self, client_id, arguments):
         workflow = self._require(client_id)
         state = self._state(client_id)
         step = workflow.step
@@ -980,7 +1356,7 @@ class WorkflowEngine:
         if verdict == "reject":
             workflow.reviews.pop(step["id"], None)
             workflow.log("%s review rejected" % step["id"])
-            snapshot = self._snapshot(client_id, workflow, missing_inspection)
+            snapshot = self._snapshot(client_id, workflow)
             snapshot["verdict"] = "rejected: fix the problem you described, then render and review again"
             return snapshot
         workflow.reviews[step["id"]] = {
@@ -991,7 +1367,7 @@ class WorkflowEngine:
             "observed": observed[:300],
         }
         workflow.log("%s review accepted (%s frames %s)" % (step["id"], fact["name"], distinct))
-        return self._snapshot(client_id, workflow, missing_inspection)
+        return self._snapshot(client_id, workflow)
 
     def _find_evidence(self, state, node, frame, digest):
         candidates = [
@@ -1031,9 +1407,9 @@ class WorkflowEngine:
 
     # ---- advance ----
 
-    def _unmet(self, workflow, state, missing_inspection, lenient=False):
+    def _unmet(self, workflow, state):
         step = workflow.step
-        context = _Context(workflow, self.facts, missing_inspection, state, lenient)
+        context = _Context(workflow, self.facts, state)
         unmet = []
         bind = step.get("bind")
         skipped = workflow.skipped.get(step["id"])
@@ -1063,7 +1439,7 @@ class WorkflowEngine:
             return "the graph changed after the accepted review of %s; render and review again" % node
         return None
 
-    def _advance(self, client_id, arguments, missing_inspection):
+    def _advance(self, client_id, arguments):
         workflow = self._require(client_id)
         state = self._state(client_id)
         step = workflow.step
@@ -1084,21 +1460,21 @@ class WorkflowEngine:
                 raise WorkflowError("skipping %s needs a reason (why this shot does not need it)" % step["id"])
             workflow.skipped[step["id"]] = reason[:200]
         if step["id"] == "next" and workflow.family == "2d":
-            return self._decide(client_id, workflow, state, arguments, missing_inspection)
-        unmet = self._unmet(workflow, state, missing_inspection)
+            return self._decide(client_id, workflow, state, arguments)
+        unmet = self._unmet(workflow, state)
         if unmet:
-            snapshot = self._snapshot(client_id, workflow, missing_inspection)
+            snapshot = self._snapshot(client_id, workflow)
             snapshot["success"] = False
             snapshot["error"] = "step %s is not complete" % step["id"]
             snapshot["unmet"] = unmet
             return snapshot
         workflow.log("%s done" % step["id"])
         if workflow.index + 1 >= len(workflow.steps):
-            return self._complete(client_id, workflow, state, missing_inspection)
+            return self._complete(client_id, workflow, state)
         workflow.index += 1
-        return self._snapshot(client_id, workflow, missing_inspection, guidance=True)
+        return self._snapshot(client_id, workflow, guidance=True)
 
-    def _decide(self, client_id, workflow, state, arguments, missing_inspection):
+    def _decide(self, client_id, workflow, state, arguments):
         choice = arguments.get("next")
         if choice not in ("layer", "finish"):
             raise WorkflowError("advance from `next` needs next=\"layer\" or next=\"finish\"")
@@ -1106,7 +1482,7 @@ class WorkflowEngine:
         if not merge or self.facts.node(merge) is None:
             raise WorkflowError("the layer's Merge no longer exists")
         if choice == "finish":
-            return self._complete(client_id, workflow, state, missing_inspection)
+            return self._complete(client_id, workflow, state)
         workflow.log("layer %d done" % workflow.layer)
         workflow.layer += 1
         workflow.targets = {"background": merge}
@@ -1114,21 +1490,21 @@ class WorkflowEngine:
         workflow.skipped.clear()
         workflow.steps = TWO_D_NEXT_LAYER
         workflow.index = 0
-        return self._snapshot(client_id, workflow, missing_inspection, guidance=True)
+        return self._snapshot(client_id, workflow, guidance=True)
 
-    def _finish_request(self, client_id, arguments, missing_inspection):
+    def _finish_request(self, client_id, arguments):
         workflow = self._require(client_id)
         state = self._state(client_id)
         if workflow.family == "2d":
             raise WorkflowError("a 2d workflow ends at its `next` step: advance with next=\"finish\"")
         if workflow.index + 1 < len(workflow.steps):
             raise WorkflowError("finish after the last step (%s); now at %s" % (workflow.steps[-1]["id"], workflow.step["id"]))
-        unmet = self._unmet(workflow, state, missing_inspection)
+        unmet = self._unmet(workflow, state)
         if unmet:
-            snapshot = self._snapshot(client_id, workflow, missing_inspection)
+            snapshot = self._snapshot(client_id, workflow)
             snapshot.update(success=False, error="step %s is not complete" % workflow.step["id"], unmet=unmet)
             return snapshot
-        return self._complete(client_id, workflow, state, missing_inspection)
+        return self._complete(client_id, workflow, state)
 
     def _result_node(self, workflow):
         for role in {
@@ -1141,7 +1517,7 @@ class WorkflowEngine:
                 return workflow.targets[role]
         return None
 
-    def _complete(self, client_id, workflow, state, missing_inspection):
+    def _complete(self, client_id, workflow, state):
         result = self._result_node(workflow)
         workflow.result = result
         workflow.log("finished")
@@ -1153,11 +1529,11 @@ class WorkflowEngine:
         }
         if parent is not None:
             parent.targets["child_result"] = result or ""
-            outcome["returned_to"] = self._status(parent, state, missing_inspection)
+            outcome["returned_to"] = self._status(parent, state)
             outcome["note"] = "result node %s is available to %s as role child_result" % (result, parent.family)
         return outcome
 
-    def _abandon(self, client_id, arguments, missing_inspection):
+    def _abandon(self, client_id, arguments):
         workflow = self._require(client_id)
         state = self._state(client_id)
         reason = str(arguments.get("reason") or "").strip()
@@ -1170,21 +1546,21 @@ class WorkflowEngine:
             "note": "built nodes stay in the graph; abandoning does not undo anything",
         }
         if state.stack:
-            outcome["returned_to"] = self._status(state.stack[-1], state, missing_inspection)
+            outcome["returned_to"] = self._status(state.stack[-1], state)
         return outcome
 
     # ---- compact status ----
 
-    def status(self, client_id: str, missing_inspection=None) -> dict | None:
+    def status(self, client_id: str) -> dict | None:
         """Compact current-step context for action results; None without a workflow."""
         workflow = self.active(client_id)
         if workflow is None:
             return None
-        return self._status(workflow, self._state(client_id), missing_inspection, brief=True)
+        return self._status(workflow, self._state(client_id), brief=True)
 
-    def _status(self, workflow, state, missing_inspection, brief=False):
+    def _status(self, workflow, state, brief=False):
         step = workflow.step
-        unmet = self._unmet(workflow, state, missing_inspection, lenient=brief and missing_inspection is None)
+        unmet = self._unmet(workflow, state)
         status = {
             "id": workflow.workflow_id,
             "family": workflow.family,
@@ -1218,9 +1594,9 @@ class WorkflowEngine:
                 captured += 1
         return {"delivered_frames": {node: sorted(set(frames)) for node, frames in delivered.items()}, "awaiting_delivery": captured}
 
-    def _snapshot(self, client_id, workflow, missing_inspection, guidance=False):
+    def _snapshot(self, client_id, workflow, guidance=False):
         state = self._state(client_id)
-        snapshot = {"success": True, "workflow": self._status(workflow, state, missing_inspection)}
+        snapshot = {"success": True, "workflow": self._status(workflow, state)}
         if guidance and self.guidance is not None:
             extra = self.guidance(workflow.step["guidance"])
             if extra:

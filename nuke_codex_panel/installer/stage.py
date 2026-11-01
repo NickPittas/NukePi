@@ -27,6 +27,7 @@ _OPTIONAL_FILES = (
     "pyproject.toml",
     Path("docs") / "INSTALLATION.md",
     Path("docs") / "USAGE.md",
+    Path("docs") / "RESEARCH-pi-extensions.md",
 )
 _OPTIONAL_DIRS = ("licenses",)
 # Generated or private entries of runtime/pi that are never copied from a source tree.

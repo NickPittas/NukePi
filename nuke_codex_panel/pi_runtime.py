@@ -103,6 +103,7 @@ def load_manifest(path: Path) -> dict:
     for section, keys in (
         ("node", ("version", "install_dir")),
         ("pi", ("package", "rpc_entry", "package_json_sha256", "package_lock_sha256", "tarball_integrity")),
+        ("ask_user", ("package", "version", "tarball_integrity", "entry", "tool")),
         ("credential_env", ("file", "sha256")),
         ("notices", ("dir", "allowed_licenses")),
     ):
@@ -176,6 +177,18 @@ def check_runtime(root: Path, manifest: dict, manifest_path: Path) -> tuple[Path
             f"{pi_spec['version']}. {hint}"
         )
     entry = _require_file(root / pi_spec["rpc_entry"], "Pi RPC entry", root)
+    ask_spec = manifest["ask_user"]
+    ask_dir = root / "node_modules" / Path(*ask_spec["package"].split("/"))
+    try:
+        ask_installed = json.loads(_require_file(ask_dir / "package.json", "installed ask_user package", root).read_text("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Private Pi runtime: invalid installed ask_user package.json: {exc}. {hint}") from exc
+    if ask_installed.get("version") != ask_spec["version"]:
+        raise RuntimeError(
+            f"Private Pi runtime: {ask_spec['package']} {ask_installed.get('version')} installed, manifest pins "
+            f"{ask_spec['version']}. {hint}"
+        )
+    _require_file(root / ask_spec["entry"], "ask_user extension entry", root)
     _require_file(root / DIAGNOSTICS_PATH.name, "Nuke runtime diagnostics extension", root)
     _require_file(root / manifest["credential_env"]["file"], "credential-env.json", root)
     return node, entry
@@ -194,6 +207,13 @@ def resolve_runtime() -> tuple[Path, Path]:
     ``RuntimeError`` when the owned runtime is absent or does not match the manifest.
     """
     return check_runtime(RUNTIME_ROOT, _manifest(), MANIFEST_PATH)
+
+
+def ask_user_extension() -> tuple[Path, str]:
+    """``(entry, tool_name)`` of the pinned ``pi-ask-user`` extension, verified by ``resolve_runtime``."""
+    spec = _manifest()["ask_user"]
+    resolve_runtime()
+    return RUNTIME_ROOT / spec["entry"], spec["tool"]
 
 
 def runtime_status() -> tuple[bool, str]:

@@ -15,6 +15,7 @@ from ..harnesses.intervention import describe_activity, describe_intervention
 from ..harnesses.pi_rpc import PiRpcClient
 from .chat_view import ChatView
 from .theme import FONT_DEFAULT, FONT_MAX, FONT_MIN, apply_theme, enlarged_font, set_variant
+from .question_widgets import OperationReportView, QuestionCard
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -181,7 +182,7 @@ class CodexPanelWidget(QtWidgets.QWidget):
         self.trusted_python.setToolTip(
             "When enabled, agent Python runs without a confirmation dialog."
         )
-        self.trusted_python.setChecked(False)
+        self.trusted_python.setChecked(True)
         layout.addWidget(self.trusted_python)
 
         capture_row = QtWidgets.QHBoxLayout()
@@ -219,6 +220,12 @@ class CodexPanelWidget(QtWidgets.QWidget):
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter, 1)
 
+        # The agent's ask_user question (one dialog at a time) and the end-of-run evidence report.
+        self.question_card = QuestionCard()
+        layout.addWidget(self.question_card)
+        self.report_view = OperationReportView()
+        layout.addWidget(self.report_view)
+
         self.prompt = QtWidgets.QPlainTextEdit()
         self.prompt.setPlaceholderText("Ask the agent about the current comp…")
         self.prompt.setMaximumHeight(110)
@@ -238,6 +245,8 @@ class CodexPanelWidget(QtWidgets.QWidget):
         self.send_button.clicked.connect(self.send_prompt)
         self.cancel_button.clicked.connect(lambda: self.client and self.client.interrupt())
         self.clear_attachments_button.clicked.connect(self.clear_pending_attachments)
+        self.question_card.option_chosen.connect(self._answer_question)
+        self.question_card.cancel_requested.connect(lambda: self.client and self.client.interrupt())
         self.model_combo.activated.connect(self._on_model_picked)
         self.manage_models_button.clicked.connect(self._manage_models)
         self.thinking_combo.activated.connect(self._on_thinking_picked)
@@ -365,6 +374,8 @@ class CodexPanelWidget(QtWidgets.QWidget):
         client.activity_changed.connect(self._on_activity_changed)
         client.guidance_withdrawn.connect(self._restore_withdrawn)
         client.model_selection_failed.connect(self._on_model_selection_failed)
+        client.question_changed.connect(self._on_question_changed)
+        client.normal_end.connect(self._on_normal_end)
 
     def _save_chat(self):
         if self.store is None or self.client is None:
@@ -395,6 +406,7 @@ class CodexPanelWidget(QtWidgets.QWidget):
         except OSError as exc:
             self._set_status("Could not archive the old chat: %s" % exc, "error")
         self.chat.clear()
+        self.report_view.clear()
         self._restored_session = False
         self.client.new_session()
         self._update_usage({})
@@ -752,8 +764,19 @@ class CodexPanelWidget(QtWidgets.QWidget):
         cancellable = (bool(client.ready) or busy) and not fresh
         model_failed = self._model_failed is not None
         model_unchosen = not isinstance(self.model_combo.currentData(), dict)
-        self.send_button.setEnabled(bool(reachable and not model_failed and not model_unchosen))
-        if fresh:
+        question = client.question_state()
+        asking = bool(question.get("active"))
+        answerable = asking and bool(question.get("answerable"))
+        typing = answerable and question.get("method") == "input"
+        # While a question is open the composer only answers it: it never sends or steers.
+        self.send_button.setEnabled(
+            typing if asking else bool(reachable and not model_failed and not model_unchosen)
+        )
+        if asking:
+            self.send_button.setText(
+                "Answer" if typing else ("Choose an option above" if answerable else "Waiting for Nuke to finish…")
+            )
+        elif fresh:
             self.send_button.setText("Starting new chat…")
         elif model_failed:
             self.send_button.setText("Model not applied — pick a model")
@@ -767,12 +790,19 @@ class CodexPanelWidget(QtWidgets.QWidget):
             self.send_button.setText("Send")
         self.cancel_button.setEnabled(bool(cancellable and busy))
         self._refresh_manage_button()
-        self.prompt.setPlaceholderText(
-            "Message the agent: sending now stops its current work safely and continues "
+        placeholder = (
+            "Type your answer to the agent's question…"
+            if asking
+            else "Message the agent: sending now stops its current work safely and continues "
             "the same conversation with your message (also /btw <message>)…"
             if busy
             else "Ask the agent about the current comp…"
         )
+        if placeholder != self.prompt.placeholderText():
+            self.prompt.setPlaceholderText(placeholder)
+            # Qt 6.5.3 (Nuke 17.1): a focused, empty QPlainTextEdit keeps painting the old placeholder
+            # (placeholderText() already returns the new one) until something else repaints it.
+            self.prompt.viewport().update()
         if busy or self._clock_timer.isActive():
             self._update_activity_label()
         if busy and not self._clock_timer.isActive():
@@ -840,11 +870,23 @@ class CodexPanelWidget(QtWidgets.QWidget):
 
     @QtCore.Slot()
     def send_prompt(self):
-        text = self.prompt.toPlainText().strip()
-        if not text or self.client is None:
+        if self.client is None:
             return
         if not self.send_button.isEnabled():
             return  # the Ctrl+Return shortcut must not bypass a disabled Send
+        question = self.client.question_state()
+        if question.get("active"):
+            # An open question: the message box answers it (typed answers only), never sends or steers.
+            # An empty answer is delivered as-is; the client accepts it only for an optional prompt.
+            if question.get("method") == "input" and self.client.answer_question(
+                question["token"], self.prompt.toPlainText()
+            ):
+                self.prompt.clear()
+                self._refresh_controls()
+            return
+        text = self.prompt.toPlainText().strip()
+        if not text:
+            return
         client = self.client
         text, _explicit = self._parse_btw(text)
         if text is None:
@@ -868,7 +910,48 @@ class CodexPanelWidget(QtWidgets.QWidget):
         if not self._from_current_client():
             return
         self.chat.start_assistant(self.client.label)
+        self.report_view.clear()
         self._refresh_controls()
+
+    @QtCore.Slot(dict)
+    def _on_question_changed(self, state: dict):
+        if not self._from_current_client():
+            return
+        self.question_card.show_question(state)
+        self._refresh_controls()
+
+    @QtCore.Slot(int, str)
+    def _answer_question(self, token: int, option: str):
+        if self.client is not None and self.client.answer_question(token, option):
+            self._refresh_controls()
+
+    @QtCore.Slot()
+    def _on_normal_end(self):
+        """A run ended normally: show the bridge's recorded evidence for it (one read-only request)."""
+        client = self.client
+        if not self._from_current_client() or self._closed:
+            return
+        try:
+            reply = self.bridge.request_local(
+                {
+                    "token": self.bridge.token,
+                    "method": "get_context",
+                    "params": {"include_nodes": False},
+                    "client_id": "panel-report-%s" % client.control_id,
+                    "control_id": client.control_id,
+                    "control_epoch": client.process_epoch,
+                }
+            )
+        except Exception as exc:
+            self._set_status("Could not read the run report: %s" % exc, "warn")
+            return
+        report = reply.get("operation_report") if reply.get("success") else None
+        if isinstance(report, dict) and report.get("nodes"):
+            self.report_view.show_report(report)
+        else:
+            self.report_view.clear()
+        if reply.get("operation_report_error"):
+            self._set_status("Run report unavailable: %s" % reply["operation_report_error"], "warn")
 
     @QtCore.Slot(str)
     def _finish_assistant_message(self, status: str):
