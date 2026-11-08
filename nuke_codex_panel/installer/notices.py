@@ -225,6 +225,8 @@ def generate_notices(
                     record["evidence_files"].append(
                         "npm/{}@{}/EVIDENCE-{}".format(_safe(name), version, evidence)
                     )
+                    if evidence != "package.json":
+                        break  # One README is enough; case variants alias on macOS/Windows.
             record["status"] = "unresolved"
         elif record["license_files"] or record["supplied_files"]:
             record["status"] = "included" if record["license_files"] else "supplied"
