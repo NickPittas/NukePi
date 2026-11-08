@@ -8,6 +8,17 @@ The panel runs one agent backend: the **official Pi 1.4.0** coding agent (MIT, `
 
 The chat streams answers token by token as Markdown bubbles (headings, lists, tables, quotes, links and code fences render without truncation). Model reasoning, replies, tool calls and delivered images appear as separate blocks **in the order they happen**. Every tool call is its own collapsible bubble with a title, status and elapsed time, formatted arguments and results, and error states; thinking blocks collapse too. Output follows the stream while you are at the bottom and holds your position while you read older content. Chat text scales with **A-** / **A+** / reset in the toolbar or the persistent `chat/font_size` setting (default 11, range 8–24). The panel and its popups use a dark, colorful theme scoped to this plug-in only; Nuke's own styling is never changed.
 
+<!-- moeffect-demo:start -->
+## Demo
+
+This Nuke tools overview includes Nuke Pi alongside NukeRTX, Smart Publisher and Resolve-to-Nuke Shot Exporter.
+
+https://github.com/user-attachments/assets/db29f247-aaeb-49be-a723-643c0534d28a
+
+[Watch on the website and read more about the tool collection](https://moeffect.gr/index.php/tools/nuke-tools/).
+
+<!-- moeffect-demo:end -->
+
 ## Chats, context, and sessions
 
 Chats are saved per project (in the app data dir, keyed by a hash of the script path, so nothing is written into project folders). When the panel opens, the previous conversation for that script is **continued automatically**: the stored Pi session is restored before the agent starts, with no resume question. Send stays disabled until the session is restored, Pi has acknowledged the model and effort, and the Nuke tools are confirmed ready. Resuming keeps the model's context across Nuke restarts. The session is a Pi session file (`--session-dir` + `--session-id`).
